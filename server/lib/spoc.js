@@ -64,10 +64,12 @@ function ackKey(data, rowHash) {
 //      here — they return their JS viewer), open the URL in headless Chromium,
 //      click the visible "Download" button and capture the resulting download
 //      event. Requires Playwright + Chromium to be installed.
-async function tryDownloadToInbox() {
+async function tryDownloadToInbox(onProgress) {
+  const emit = (stage, pct, detail) => { try { onProgress && onProgress(stage, pct, detail); } catch (_) {} };
   const url = getDownloadUrl();
-  if (!url) return { attempted: false };
+  if (!url) { emit('download', 100, 'no remote URL configured — using inbox only'); return { attempted: false }; }
   ensureInbox();
+  emit('download', 5, 'fetching remote URL');
   // ---------- Step 1: plain GET ----------
   try {
     const res = await fetch(url, {
@@ -97,6 +99,7 @@ async function tryDownloadToInbox() {
         }
         const full = path.join(INBOX_DIR, filename);
         fs.writeFileSync(full, buf);
+        emit('download', 35, `downloaded ${filename} (${buf.length} bytes via http)`);
         return { attempted: true, ok: true, file: filename, bytes: buf.length, via: 'http', sniffed, contentType: ctype };
       }
       // Fall through to headless-browser path.
@@ -106,10 +109,12 @@ async function tryDownloadToInbox() {
     var fetchErr = e.message;
   }
   // ---------- Step 2: headless browser ----------
-  return await downloadViaBrowser(url);
+  emit('download', 12, 'http fetch returned a viewer page — launching headless Chromium');
+  return await downloadViaBrowser(url, emit);
 }
 
-async function downloadViaBrowser(url) {
+async function downloadViaBrowser(url, emit) {
+  emit = emit || (() => {});
   let chromium;
   try { ({ chromium } = require('playwright')); }
   catch (e) {
@@ -118,18 +123,22 @@ async function downloadViaBrowser(url) {
   }
   let browser;
   try {
+    emit('download', 15, 'launching Chromium');
     browser = await chromium.launch({ headless: true });
     const ctx = await browser.newContext({ acceptDownloads: true });
     const page = await ctx.newPage();
+    emit('download', 20, 'opening share URL');
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     // Wait for a clickable Download button (Zoho external-share viewer pattern).
     // If a future page layout puts the file in an <a download> link instead,
     // the same waitForEvent('download') still fires.
     let clickedDownload = false;
     try {
+      emit('download', 25, 'waiting for Download button');
       await page.waitForSelector('button:has-text("Download"), a[download]', { timeout: 30000 });
       clickedDownload = true;
     } catch (_) {}
+    emit('download', 28, clickedDownload ? 'clicking Download' : 'no Download button found — waiting for auto download');
     const [download] = await Promise.all([
       page.waitForEvent('download', { timeout: 60000 }).catch(() => null),
       clickedDownload
@@ -142,8 +151,10 @@ async function downloadViaBrowser(url) {
     }
     const suggested = download.suggestedFilename() || `spoc-${new Date().toISOString().replace(/[:.]/g, '-')}.xlsx`;
     const full = path.join(INBOX_DIR, suggested);
+    emit('download', 32, `saving ${suggested}`);
     await download.saveAs(full);
     const bytes = (() => { try { return fs.statSync(full).size; } catch { return null; } })();
+    emit('download', 38, `downloaded ${suggested} (${bytes || '?'} bytes via browser)`);
     return { attempted: true, ok: true, via: 'browser', file: suggested, bytes, sourceUrl: download.url() };
   } catch (e) {
     return { attempted: true, ok: false, via: 'browser', error: e.message };
@@ -340,14 +351,18 @@ function parseFile(full) {
 
 // Run import for the newest file in the inbox. Returns a summary suitable for
 // the scheduler `lastresult` payload.
-async function runImport({ force = false } = {}) {
+async function runImport({ force = false, onProgress } = {}) {
+  const emit = (stage, pct, detail) => { try { onProgress && onProgress(stage, pct, detail); } catch (_) {} };
   const startedAt = Date.now();
   ensureInbox();
+  emit('start', 1, 'starting import');
   // Best-effort remote pull first. Failure here is non-fatal — we still try
   // the inbox so a manually-dropped file works regardless.
-  const download = await tryDownloadToInbox();
+  const download = await tryDownloadToInbox(onProgress);
+  emit('scan', 42, 'scanning inbox');
   const files = listInboxFiles();
   if (!files.length) {
+    emit('done', 100, 'no files to import');
     return { startedAt, finishedAt: Date.now(), file: null, skipped: true,
              reason: download.attempted && !download.ok
                ? `remote download failed: ${download.error}`
@@ -355,18 +370,24 @@ async function runImport({ force = false } = {}) {
              download };
   }
   const f = files[0];
+  emit('hash', 46, `hashing ${f.name}`);
   const sha = sha256File(f.full);
   if (!force) {
     const existing = db.prepare('SELECT id FROM spoc_imports WHERE file_sha256=?').get(sha);
     if (existing) {
+      emit('done', 100, 'already imported');
       return { startedAt, finishedAt: Date.now(), file: f.name, sha,
                skipped: true, reason: 'already imported (same sha256)', download };
     }
   }
   let sheets;
   try {
+    emit('parse', 55, `parsing ${f.name}`);
     sheets = parseFile(f.full);
+    const totalRows = sheets.reduce((n, s) => n + s.rows.length, 0);
+    emit('parse', 65, `parsed ${sheets.length} sheet(s), ${totalRows} rows`);
   } catch (e) {
+    emit('error', 100, `parse failed: ${e.message}`);
     return { startedAt, finishedAt: Date.now(), file: f.name, sha,
              error: `parse failed: ${e.message}`, download };
   }
@@ -385,17 +406,27 @@ async function runImport({ force = false } = {}) {
             source_file = excluded.source_file,
             last_seen   = CURRENT_TIMESTAMP`);
   const sel = db.prepare('SELECT id FROM spoc_entries WHERE dedup_key=?');
+  const totalRowsAcrossSheets = sheets.reduce((n, s) => n + s.rows.length, 0) || 1;
+  let processed = 0;
+  let lastEmit = 0;
   const tx = db.transaction(() => {
     for (const s of sheets) {
       for (const row of s.rows) {
         rowsTotal++;
         const norm = normaliseRow(row);
-        if (!Object.keys(norm).length) continue;
+        if (!Object.keys(norm).length) { processed++; continue; }
         const h = rowHash(s.sheet, norm);
         const key = ackKey(norm, h);
         const before = sel.get(key);
         ins.run(key, h, s.sheet, JSON.stringify(norm), f.name);
         if (!before) rowsNew++;
+        processed++;
+        // Emit at most every 25 rows to avoid log spam.
+        if (processed - lastEmit >= 25 || processed === totalRowsAcrossSheets) {
+          lastEmit = processed;
+          const pct = 70 + Math.round((processed / totalRowsAcrossSheets) * 25); // 70 → 95
+          emit('write', pct, `writing rows ${processed}/${totalRowsAcrossSheets} (${rowsNew} new)`);
+        }
       }
     }
     db.prepare(`INSERT OR REPLACE INTO spoc_imports
@@ -415,6 +446,7 @@ async function runImport({ force = false } = {}) {
     try { fs.unlinkSync(f.full); deleted = true; }
     catch (e) { console.warn(`[spoc] could not delete ${f.full}: ${e.message}`); }
   }
+  emit('done', 100, `imported ${rowsNew}/${rowsTotal} new rows from ${f.name}`);
   return { startedAt, finishedAt: Date.now(), file: f.name, sha,
            rowsTotal, rowsNew, sheets: sheets.map(s => ({ sheet: s.sheet, rows: s.rows.length })),
            download, deleted };

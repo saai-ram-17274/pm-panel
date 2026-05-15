@@ -297,6 +297,10 @@ const llm = require('./lib/llm');
 const spoc = require('./lib/spoc');
 const chatTools = require('./lib/chat-tools');
 
+// In-memory tracker for the SPOC import job so the UI can render a progress
+// bar while runImport (download → parse → DB write) is in flight.
+const spocJobs = new Map();
+
 crud('sources', 'sources', ['product_id', 'kind', 'url', 'label'], { orderBy: 'product_id, id DESC' });
 
 app.get('/api/llm/status', (req, res) => res.json(llm.status()));
@@ -1260,8 +1264,82 @@ app.post('/api/spoc/ack', (req, res) => {
 });
 
 app.post('/api/spoc/import-now', async (req, res) => {
-  try { res.json(await spoc.runImport({ force: !!(req.body && req.body.force) })); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  const force = !!(req.body && req.body.force);
+  // Background-job model so the UI can render a progress bar instead of just
+  // a spinner. The handler returns { jobId } immediately; the client polls
+  // /api/spoc/import-status/:jobId every ~500ms until status === 'done' or
+  // 'error'. Job records live in memory and are auto-evicted after 5 min.
+  const jobId = `spoc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const job = {
+    id: jobId,
+    status: 'running',
+    stage: 'start',
+    pct: 0,
+    detail: 'queued',
+    startedAt: Date.now(),
+    finishedAt: null,
+    result: null,
+    error: null,
+    log: [],
+  };
+  spocJobs.set(jobId, job);
+  // Fire-and-forget. Errors are caught and stored on the job.
+  (async () => {
+    try {
+      const result = await spoc.runImport({
+        force,
+        onProgress: (stage, pct, detail) => {
+          job.stage = stage;
+          if (typeof pct === 'number') job.pct = Math.max(job.pct, Math.min(100, Math.round(pct)));
+          if (detail) {
+            job.detail = detail;
+            job.log.push({ t: Date.now(), stage, pct: job.pct, detail });
+            if (job.log.length > 200) job.log.splice(0, job.log.length - 200);
+          }
+        },
+      });
+      job.result = result;
+      job.status = result && result.error ? 'error' : 'done';
+      if (result && result.error) job.error = result.error;
+      job.pct = 100;
+      job.stage = job.status === 'error' ? 'error' : 'done';
+      job.finishedAt = Date.now();
+    } catch (e) {
+      job.status = 'error';
+      job.stage = 'error';
+      job.error = e.message;
+      job.detail = e.message;
+      job.pct = 100;
+      job.finishedAt = Date.now();
+    } finally {
+      // Evict 5 minutes after completion so memory doesn't grow.
+      setTimeout(() => spocJobs.delete(jobId), 5 * 60 * 1000).unref?.();
+    }
+  })();
+  // Optional synchronous mode for scripts/tests: ?wait=1 blocks until done.
+  if (req.query.wait === '1') {
+    const poll = () => new Promise(r => setTimeout(r, 200));
+    while (job.status === 'running') await poll();
+    return res.json({ jobId, ...job });
+  }
+  res.json({ jobId, status: job.status, stage: job.stage, pct: job.pct, detail: job.detail });
+});
+
+app.get('/api/spoc/import-status/:jobId', (req, res) => {
+  const job = spocJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'unknown jobId (may have expired)' });
+  res.json({
+    id: job.id,
+    status: job.status,
+    stage: job.stage,
+    pct: job.pct,
+    detail: job.detail,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+    result: job.status === 'done' ? job.result : null,
+    error: job.error,
+    log: job.log.slice(-20), // last 20 events
+  });
 });
 
 // SPA fallback: any non-API GET that isn't a static file -> serve index.html

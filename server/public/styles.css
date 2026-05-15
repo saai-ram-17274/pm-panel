@@ -2911,6 +2911,59 @@ a.icon-btn { text-decoration: none; }
 }
 .spoc-empty p:first-child { color: var(--text); font-size: 15px; margin: 0 0 6px; }
 
+/* SPOC import progress bar (shown in Settings → SPOC while a sync runs) */
+.spoc-progress {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--panel);
+  font-size: 12px;
+}
+.spoc-progress-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  margin-bottom: 6px;
+}
+.spoc-progress-stage { font-weight: 600; color: var(--text); }
+.spoc-progress-pct   { font-variant-numeric: tabular-nums; color: var(--muted); }
+.spoc-progress-bar {
+  position: relative;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.06);
+  overflow: hidden;
+}
+.spoc-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #3b82f6, #06b6d4);
+  border-radius: 999px;
+  transition: width 280ms ease;
+  box-shadow: 0 0 8px rgba(59,130,246,0.45);
+}
+.spoc-progress-fill.ok  { background: linear-gradient(90deg, #16a34a, #22c55e); box-shadow: 0 0 8px rgba(34,197,94,0.45); }
+.spoc-progress-fill.err { background: linear-gradient(90deg, #b91c1c, #ef4444); box-shadow: 0 0 8px rgba(239,68,68,0.45); }
+/* indeterminate shimmer while running */
+.spoc-progress-fill::after {
+  content: '';
+  position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.25), transparent);
+  animation: spocShimmer 1.4s linear infinite;
+}
+.spoc-progress-fill.ok::after,
+.spoc-progress-fill.err::after { animation: none; opacity: 0; }
+@keyframes spocShimmer {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(100%); }
+}
+.spoc-progress-detail {
+  margin-top: 6px;
+  color: var(--muted);
+  font-family: monospace;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .spoc-pager {
   display: flex; gap: 8px; justify-content: center; align-items: center;
   margin-top: 16px;

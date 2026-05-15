@@ -4229,6 +4229,19 @@ function SpocEntries() {
   );
 }
 
+// Friendly labels for the SPOC import job stages emitted by spoc.runImport.
+const SPOC_STAGE_LABELS = {
+  start:    'Starting…',
+  download: 'Downloading from Zoho…',
+  scan:     'Scanning inbox…',
+  hash:     'Hashing file…',
+  parse:    'Parsing spreadsheet…',
+  write:    'Writing to database…',
+  done:     'Done',
+  error:    'Failed',
+};
+function stageLabel(s) { return SPOC_STAGE_LABELS[s] || s || '…'; }
+
 // SPOC admin panel — embedded inside the Settings tab. All the import config,
 // download URL, manual import, history and inbox listing live here.
 function SpocSettingsPanel() {
@@ -4239,6 +4252,9 @@ function SpocSettingsPanel() {
   const [urlDraft, setUrlDraft] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  // Live progress for the SPOC import job. While running we poll
+  // /spoc/import-status/:jobId every 500ms and render a progress bar.
+  const [progress, setProgress] = useState(null); // { stage, pct, detail, status }
 
   const reload = () => {
     api.get('/spoc/inbox').then(r => { setInbox(r); setUrlDraft(r.downloadUrl || ''); }).catch(()=>{});
@@ -4266,17 +4282,51 @@ function SpocSettingsPanel() {
 
   const importNow = async (force = false) => {
     setBusy(true); setErr('');
+    setProgress({ stage: 'start', pct: 0, detail: 'starting…', status: 'running' });
     try {
       const r = await api.post('/spoc/import-now', { force });
-      if (r.error) { setErr(r.error); window.toast && window.toast(r.error, 'error'); }
-      else if (r.skipped) { window.toast && window.toast(`Skipped: ${r.reason}`, 'info', 6000); }
-      else { window.toast && window.toast(`Imported ${r.rowsNew}/${r.rowsTotal} new rows from ${r.file}`, 'success'); }
-      if (r.download && r.download.attempted && !r.download.ok) {
-        window.toast && window.toast(`Remote download: ${r.download.error}`, 'warn', 6000);
+      const jobId = r && r.jobId;
+      if (!jobId) {
+        // Server fell back to legacy synchronous response.
+        setProgress(null);
+        if (r.error) { setErr(r.error); window.toast && window.toast(r.error, 'error'); }
+        else if (r.skipped) { window.toast && window.toast(`Skipped: ${r.reason}`, 'info', 6000); }
+        else { window.toast && window.toast(`Imported ${r.rowsNew}/${r.rowsTotal} new rows from ${r.file}`, 'success'); }
+        reload();
+        return;
+      }
+      // Poll until the job finishes.
+      let final = null;
+      while (true) {
+        await new Promise(res => setTimeout(res, 500));
+        let s;
+        try { s = await api.get('/spoc/import-status/' + jobId); }
+        catch (e) { setErr(e.message); break; }
+        setProgress({ stage: s.stage, pct: s.pct, detail: s.detail, status: s.status });
+        if (s.status !== 'running') { final = s; break; }
+      }
+      if (final) {
+        const result = final.result || {};
+        if (final.status === 'error' || result.error) {
+          const msg = final.error || result.error;
+          setErr(msg);
+          window.toast && window.toast(msg, 'error');
+        } else if (result.skipped) {
+          window.toast && window.toast(`Skipped: ${result.reason}`, 'info', 6000);
+        } else {
+          window.toast && window.toast(`Imported ${result.rowsNew}/${result.rowsTotal} new rows from ${result.file}`, 'success');
+        }
+        if (result.download && result.download.attempted && !result.download.ok) {
+          window.toast && window.toast(`Remote download: ${result.download.error}`, 'warn', 6000);
+        }
       }
       reload();
     } catch (e) { setErr(e.message); }
-    finally { setBusy(false); }
+    finally {
+      setBusy(false);
+      // Keep the bar visible briefly at 100% so the user sees "done".
+      setTimeout(() => setProgress(null), 1500);
+    }
   };
 
   return (
@@ -4311,6 +4361,21 @@ function SpocSettingsPanel() {
           <button className="ghost" disabled={busy} onClick={() => importNow(false)}>{busy ? 'Importing…' : 'Import now'}</button>
           <button className="ghost small" disabled={busy} onClick={() => importNow(true)} title="Re-parse even if the file's sha256 was already imported">Force re-import</button>
         </div>
+        {progress && (
+          <div className="spoc-progress" style={{marginTop:10}}>
+            <div className="spoc-progress-head">
+              <span className="spoc-progress-stage">{stageLabel(progress.stage)}</span>
+              <span className="spoc-progress-pct">{progress.pct || 0}%</span>
+            </div>
+            <div className="spoc-progress-bar">
+              <div
+                className={'spoc-progress-fill' + (progress.status === 'error' ? ' err' : '') + (progress.status === 'done' ? ' ok' : '')}
+                style={{width: `${Math.max(2, progress.pct || 0)}%`}}
+              />
+            </div>
+            <div className="spoc-progress-detail" title={progress.detail || ''}>{progress.detail || ''}</div>
+          </div>
+        )}
         <div className="muted" style={{fontSize:11, marginTop:4}}>
           Watched folder: <code>{inbox.dir}</code>. Manually-dropped XLSX/CSV files are picked up too — newest wins.
         </div>
