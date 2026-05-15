@@ -1,0 +1,88 @@
+# ---------- Node / npm ----------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+.pnp.*
+.yarn/
+
+# ---------- Build output ----------
+dist/
+build/
+out/
+.cache/
+.parcel-cache/
+.vite/
+.next/
+.turbo/
+
+# ---------- Environment / secrets ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets.json
+config.local.*
+
+# ---------- Database files (local SQLite) ----------
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+server/data/
+server/*.sqlite*
+server/*.db*
+
+# ---------- SPOC ingest artefacts ----------
+spoc-inbox/
+server/spoc-inbox/
+*.xlsx
+*.xls
+*.csv
+!server/lib/**/*sample*.csv
+
+# ---------- Playwright ----------
+playwright-report/
+test-results/
+.playwright/
+ms-playwright/
+
+# ---------- Logs / runtime ----------
+logs/
+*.log
+*.pid
+.pm-panel.pid
+server/.pm-panel.pid
+
+# ---------- OS junk ----------
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ---------- Editor / IDE ----------
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# ---------- Misc ----------
+coverage/
+*.tgz
+*.zip
+*.tmp
+tmp/
