@@ -1,0 +1,35 @@
+# Normalize line endings: store everything as LF in the repo, let Git convert
+# on checkout per the user's core.autocrlf setting. This prevents the noisy
+# "LF will be replaced by CRLF" warnings when the same file is edited on
+# Windows and Linux.
+* text=auto eol=lf
+
+# Shell scripts must stay LF on disk even on Windows checkouts, otherwise
+# bash will complain about ^M.
+*.sh        text eol=lf
+pm-panel.sh text eol=lf
+
+# Windows batch files keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files — never touch.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.pdf   binary
+*.zip   binary
+*.tgz   binary
+*.gz    binary
+*.xlsx  binary
+*.xls   binary
+*.node  binary
+*.dll   binary
+*.so    binary
+*.dylib binary
+*.db    binary
+*.sqlite  binary
+*.sqlite3 binary
