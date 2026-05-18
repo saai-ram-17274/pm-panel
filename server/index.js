@@ -1,3 +1,7 @@
+// Load .env from this directory before anything else requires process.env
+// (mailer.js reads ZOHO_MAIL_* at import time).
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
+
 const express = require('express');
 const cors = require('cors');
 const db = require('./db');

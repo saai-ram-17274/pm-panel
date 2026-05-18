@@ -4462,8 +4462,10 @@ function MailDigestSettingsPanel() {
           type="time"
           value={timeDraft}
           onChange={e => setTimeDraft(e.target.value)}
+          onClick={e => { try { e.currentTarget.showPicker && e.currentTarget.showPicker(); } catch (_) {} }}
+          onFocus={e => { try { e.currentTarget.showPicker && e.currentTarget.showPicker(); } catch (_) {} }}
           disabled={savingTime}
-          style={{padding:'6px 10px', border:'1px solid var(--border)', borderRadius:4, background:'var(--bg)', color:'var(--text)'}}
+          style={{padding:'6px 10px', border:'1px solid var(--border)', borderRadius:4, background:'var(--bg)', color:'var(--text)', cursor:'pointer'}}
         />
         <button type="submit" className="primary" disabled={savingTime || !timeDraft || (status && timeDraft === status.digestTime)}>
           {savingTime ? 'Saving…' : 'Save time'}
