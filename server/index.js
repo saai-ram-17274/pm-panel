@@ -318,6 +318,8 @@ const { ingestRss, ingestHtml, ingestManual } = require('./lib/ingest');
 const { extractFeatures, scoreImplementability } = require('./lib/analyzer');
 const llm = require('./lib/llm');
 const spoc = require('./lib/spoc');
+const mailer = require('./lib/mailer');
+const dailyDigest = require('./lib/daily-digest');
 const chatTools = require('./lib/chat-tools');
 
 // In-memory tracker for the SPOC import job so the UI can render a progress
@@ -1072,6 +1074,22 @@ const SCHEDULER_KINDS = [
   // Daily SPOC sheet sync. `hour` makes the slot daily-at-HH:MM instead of hourly-at-:MM.
   { key: 'spoc',     label: 'SPOC sheet sync',    minute: 10, hour: 0,
     run: async () => spoc.runImport() },
+  // Daily digest email. Defaults to 00:15 IST (right after SPOC sync at 00:10)
+  // so the digest covers the freshly-imported sheet. The fire time is editable
+  // from Settings → Email digest; the getters below read from `settings` on
+  // every scheduler tick, so changes apply without a restart.
+  { key: 'digest',   label: 'Daily digest email',
+    get minute() { const v = +readSettingRaw('mail_digest_minute'); return Number.isFinite(v) ? v : 15; },
+    get hour()   { const v = +readSettingRaw('mail_digest_hour');   return Number.isFinite(v) ? v : 0; },
+    run: async () => {
+      if (!mailer.isConfigured()) return { skipped: true, reason: 'mailer not configured' };
+      const to = getDailyRecipients();
+      if (!to || !String(to).trim()) return { skipped: true, reason: 'no recipients saved' };
+      const d = dailyDigest.build();
+      const r = await mailer.sendMail({ to: to.split(',').map(s => s.trim()).filter(Boolean),
+        subject: d.subject, html: d.html });
+      return { sent: true, to, messageId: r.messageId || null, ...d.stats };
+    } },
 ];
 
 function schedulerSettingKey(jobKey, field) { return `scheduler_${jobKey}_${field}`; }
@@ -1256,6 +1274,117 @@ app.post('/api/scheduler/run-now/:key', async (req, res) => {
   // Fire and forget; client polls /api/ingest/all-progress for live status.
   runScheduledJob(job);
   res.json({ ok: true });
+});
+
+// ─── Mailer / Daily digest ───────────────────────────────────────────────────
+// Recipient list is editable from the UI and persisted in `settings`. We fall
+// back to the ZOHO_MAIL_DAILY_TO env var when nothing is saved yet so a fresh
+// install still works.
+function getDailyRecipients() {
+  const saved = readSettingRaw('mail_daily_to');
+  if (saved != null && saved !== '') return saved;
+  return process.env.ZOHO_MAIL_DAILY_TO || '';
+}
+function setDailyRecipients(v) {
+  writeSettingRaw('mail_daily_to', String(v == null ? '' : v).trim());
+}
+function getDigestTime() {
+  const h = +readSettingRaw('mail_digest_hour');
+  const m = +readSettingRaw('mail_digest_minute');
+  return {
+    hour:   Number.isFinite(h) ? h : 0,
+    minute: Number.isFinite(m) ? m : 15,
+  };
+}
+function setDigestTime(hour, minute) {
+  const h = Math.max(0, Math.min(23, Math.trunc(+hour)));
+  const m = Math.max(0, Math.min(59, Math.trunc(+minute)));
+  writeSettingRaw('mail_digest_hour', String(h));
+  writeSettingRaw('mail_digest_minute', String(m));
+  return { hour: h, minute: m };
+}
+function parseDigestTime(raw) {
+  // Accept "HH:MM" or { hour, minute }.
+  if (raw && typeof raw === 'object' && raw.hour != null && raw.minute != null) {
+    return { hour: +raw.hour, minute: +raw.minute };
+  }
+  const s = String(raw || '').trim();
+  const m = s.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  return { hour: +m[1], minute: +m[2] };
+}
+app.get('/api/mail/status', (_req, res) => {
+  const dailyTo = getDailyRecipients();
+  const time = getDigestTime();
+  res.json({
+    configured: mailer.isConfigured(),
+    from: process.env.ZOHO_MAIL_FROM || null,
+    accountId: process.env.ZOHO_MAIL_ACCOUNT_ID || null,
+    dailyTo,
+    recipients: dailyTo ? dailyTo.split(',').map(s => s.trim()).filter(Boolean) : [],
+    digestTime: `${String(time.hour).padStart(2,'0')}:${String(time.minute).padStart(2,'0')}`,
+    digestHour: time.hour,
+    digestMinute: time.minute,
+  });
+});
+app.put('/api/mail/settings', (req, res) => {
+  const body = req.body || {};
+  // Recipients (optional on this call — only updated when provided).
+  if (body.dailyTo != null || body.recipients != null) {
+    const to = body.dailyTo != null ? body.dailyTo : body.recipients;
+    const joined = Array.isArray(to) ? to.join(',') : String(to);
+    const entries = joined.split(',').map(s => s.trim()).filter(Boolean);
+    const bad = entries.filter(e => !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e));
+    if (bad.length) return res.status(400).json({ error: `invalid email(s): ${bad.join(', ')}` });
+    setDailyRecipients(entries.join(','));
+  }
+  // Digest time (optional on this call).
+  if (body.digestTime != null || (body.digestHour != null && body.digestMinute != null)) {
+    const parsed = body.digestTime != null
+      ? parseDigestTime(body.digestTime)
+      : { hour: +body.digestHour, minute: +body.digestMinute };
+    if (!parsed || !Number.isFinite(parsed.hour) || !Number.isFinite(parsed.minute)
+        || parsed.hour < 0 || parsed.hour > 23 || parsed.minute < 0 || parsed.minute > 59) {
+      return res.status(400).json({ error: 'digestTime must be "HH:MM" (00:00 — 23:59)' });
+    }
+    setDigestTime(parsed.hour, parsed.minute);
+  }
+  const dailyTo = getDailyRecipients();
+  const time = getDigestTime();
+  res.json({
+    ok: true,
+    dailyTo,
+    recipients: dailyTo ? dailyTo.split(',').map(s => s.trim()).filter(Boolean) : [],
+    digestTime: `${String(time.hour).padStart(2,'0')}:${String(time.minute).padStart(2,'0')}`,
+    digestHour: time.hour,
+    digestMinute: time.minute,
+  });
+});
+app.get('/api/mail/digest/preview', (_req, res) => {
+  try {
+    const d = dailyDigest.build();
+    res.set('Content-Type', 'text/html; charset=utf-8').send(d.html);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/mail/digest/send-now', async (req, res) => {
+  try {
+    if (!mailer.isConfigured()) return res.status(400).json({ error: 'mailer not configured (ZOHO_MAIL_* env vars)' });
+    const toRaw = (req.body && req.body.to) || getDailyRecipients();
+    if (!toRaw || !String(toRaw).trim()) return res.status(400).json({ error: 'no recipient (body.to or saved recipients)' });
+    const d = dailyDigest.build();
+    const r = await mailer.sendMail({
+      to: String(toRaw).split(',').map(s => s.trim()).filter(Boolean),
+      subject: d.subject, html: d.html,
+    });
+    res.json({ ok: true, messageId: r.messageId || null, to: toRaw, stats: d.stats });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/mail/send', async (req, res) => {
+  try {
+    const { to, cc, bcc, subject, html, text } = req.body || {};
+    const r = await mailer.sendMail({ to, cc, bcc, subject, html, text });
+    res.json({ ok: true, ...r });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ---------- SPOC ----------

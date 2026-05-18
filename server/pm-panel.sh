@@ -51,6 +51,13 @@ start() {
     return 0
   fi
   echo "Starting PM Panel ($NODE_BIN index.js) on port $PORT ..."
+  # Load .env (KEY=VALUE per line, no shell escaping). Exported so child sees it.
+  if [[ -f "$SCRIPT_DIR/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/.env"
+    set +a
+  fi
   nohup "$NODE_BIN" index.js > "$LOG_FILE" 2>&1 &
   echo $! > "$PID_FILE"
   disown || true

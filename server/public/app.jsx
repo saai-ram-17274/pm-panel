@@ -4332,6 +4332,226 @@ function formatCell(v) {
   return s;
 }
 
+function MailDigestSettingsPanel() {
+  const [status, setStatus] = useState(null);
+  const [recipients, setRecipients] = useState([]);
+  const [draft, setDraft] = useState('');
+  const [timeDraft, setTimeDraft] = useState('00:15');
+  const [busy, setBusy] = useState(false);
+  const [savingTime, setSavingTime] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [scheduler, setScheduler] = useState(null);
+
+  const load = () => {
+    api.get('/mail/status').then(s => {
+      setStatus(s);
+      setRecipients(s.recipients || []);
+      if (s.digestTime) setTimeDraft(s.digestTime);
+    }).catch(()=>{});
+    api.get('/scheduler/status').then(setScheduler).catch(()=>{});
+  };
+  useEffect(() => { load(); }, []);
+
+  const isEmail = (s) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s || '').trim());
+
+  const addRecipient = async (raw) => {
+    const list = String(raw || '').split(/[,\s;]+/).map(s => s.trim()).filter(Boolean);
+    if (!list.length) return;
+    const bad = list.filter(e => !isEmail(e));
+    if (bad.length) { window.toast && window.toast('Invalid email: ' + bad.join(', '), 'error'); return; }
+    const next = Array.from(new Set([...recipients, ...list]));
+    await save(next);
+  };
+  const removeRecipient = async (e) => {
+    const next = recipients.filter(r => r !== e);
+    await save(next);
+  };
+  const save = async (next) => {
+    setBusy(true);
+    try {
+      const r = await api.put('/mail/settings', { recipients: next });
+      if (r.error) { window.toast && window.toast(r.error, 'error'); return; }
+      setRecipients(r.recipients || []);
+      setDraft('');
+      window.toast && window.toast('Saved', 'success');
+    } finally { setBusy(false); }
+  };
+  const sendNow = async (overrideTo) => {
+    setSending(true);
+    try {
+      const body = overrideTo ? { to: overrideTo } : {};
+      const r = await api.post('/mail/digest/send-now', body);
+      if (r.error) { window.toast && window.toast(r.error, 'error'); return; }
+      window.toast && window.toast(`Sent to ${r.to}`, 'success');
+      load();
+    } finally { setSending(false); }
+  };
+
+  const digestJob = scheduler && (scheduler.jobs || []).find(j => j.key === 'digest');
+  const nextRunStr = digestJob && digestJob.nextRun ? new Date(digestJob.nextRun).toLocaleString() : '—';
+  const lastRunStr = digestJob && digestJob.lastRun ? new Date(digestJob.lastRun).toLocaleString() : 'never';
+
+  const saveTime = async () => {
+    if (!/^\d{1,2}:\d{2}$/.test(timeDraft)) { window.toast && window.toast('Time must be HH:MM', 'error'); return; }
+    setSavingTime(true);
+    try {
+      const r = await api.put('/mail/settings', { digestTime: timeDraft });
+      if (r.error) { window.toast && window.toast(r.error, 'error'); return; }
+      setStatus(s => ({ ...(s||{}), digestTime: r.digestTime, digestHour: r.digestHour, digestMinute: r.digestMinute }));
+      window.toast && window.toast(`Digest time saved (${r.digestTime})`, 'success');
+      // Refresh scheduler card so nextRun reflects the new slot.
+      api.get('/scheduler/status').then(setScheduler).catch(()=>{});
+    } finally { setSavingTime(false); }
+  };
+
+  return (
+    <>
+      <h3 style={{marginTop:0, display:'flex', alignItems:'center', gap:8}}>
+        <Icon name="feed" size={18} /> Email digest
+      </h3>
+      <p className="meta" style={{fontSize:12, marginTop:-6}}>
+        Daily digest sent at <strong>{status && status.digestTime ? `${status.digestTime} IST` : '—'}</strong>.
+        Includes SPOC tickets from the last 24h (with chat links) and competitive / analyst / industry-news feed activity.
+        SPOC sync runs at 00:10 IST — pick a digest time after that so the latest sheet data is included.
+      </p>
+
+      {status && !status.configured && (
+        <div className="callout" style={{padding:10, border:'1px solid #f59e0b', borderRadius:6, background:'rgba(245,158,11,0.08)', marginBottom:12}}>
+          <strong>Not configured.</strong> Set <code>ZOHO_MAIL_CLIENT_ID</code>, <code>ZOHO_MAIL_CLIENT_SECRET</code>,
+          <code> ZOHO_MAIL_REFRESH_TOKEN</code>, <code>ZOHO_MAIL_ACCOUNT_ID</code> and <code>ZOHO_MAIL_FROM</code>
+          in <code>server/.env</code>, then restart pm-panel.
+        </div>
+      )}
+
+      {status && status.configured && (
+        <div style={{display:'grid', gridTemplateColumns:'160px 1fr', rowGap:6, fontSize:13, marginBottom:14}}>
+          <div className="meta">From</div><div><code>{status.from}</code></div>
+          <div className="meta">Account ID</div><div><code>{status.accountId}</code></div>
+          <div className="meta">Scheduler</div>
+          <div>
+            {scheduler && scheduler.enabled ? <span className="badge success">enabled</span>
+                                            : <span className="badge low">disabled</span>}
+            {' '}<span className="meta" style={{fontSize:12}}>
+              · next run {nextRunStr} · last run {lastRunStr}
+            </span>
+          </div>
+          {digestJob && digestJob.lastResult && (
+            <>
+              <div className="meta">Last result</div>
+              <div style={{fontSize:12}}>
+                {digestJob.lastResult.error
+                  ? <span style={{color:'#ef4444'}}>error: {digestJob.lastResult.error}</span>
+                  : digestJob.lastResult.skipped
+                    ? <span className="meta">skipped: {digestJob.lastResult.reason}</span>
+                    : <>sent · messageId <code>{digestJob.lastResult.messageId || '?'}</code></>}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      <h4 style={{marginBottom:6}}>Send time</h4>
+      <p className="meta" style={{fontSize:12, marginTop:-4, marginBottom:8}}>
+        Server clock is Asia/Kolkata, so this is the local IST time the digest fires every day.
+      </p>
+      <form
+        onSubmit={(e) => { e.preventDefault(); saveTime(); }}
+        style={{display:'flex', gap:6, marginBottom:18, alignItems:'center'}}
+      >
+        <input
+          type="time"
+          value={timeDraft}
+          onChange={e => setTimeDraft(e.target.value)}
+          disabled={savingTime}
+          style={{padding:'6px 10px', border:'1px solid var(--border)', borderRadius:4, background:'var(--bg)', color:'var(--text)'}}
+        />
+        <button type="submit" className="primary" disabled={savingTime || !timeDraft || (status && timeDraft === status.digestTime)}>
+          {savingTime ? 'Saving…' : 'Save time'}
+        </button>
+        {status && status.digestTime && (
+          <span className="meta" style={{fontSize:12}}>
+            current: <code>{status.digestTime}</code>
+          </span>
+        )}
+      </form>
+
+      <h4 style={{marginBottom:6}}>Recipients</h4>
+      <div style={{display:'flex', flexWrap:'wrap', gap:6, marginBottom:8}}>
+        {recipients.length === 0 && <span className="meta" style={{fontSize:12}}>No recipients saved — daily digest will be skipped.</span>}
+        {recipients.map(r => (
+          <span key={r} className="chip" style={{display:'inline-flex', alignItems:'center', gap:6, padding:'3px 8px', border:'1px solid var(--border)', borderRadius:12, fontSize:12, background:'var(--bg-soft)'}}>
+            {r}
+            <button
+              type="button"
+              onClick={() => removeRecipient(r)}
+              disabled={busy}
+              title="Remove"
+              style={{background:'transparent', border:'none', color:'var(--muted)', cursor:'pointer', padding:0, fontSize:14, lineHeight:1}}
+            >×</button>
+          </span>
+        ))}
+      </div>
+      <form
+        onSubmit={(e) => { e.preventDefault(); addRecipient(draft); }}
+        style={{display:'flex', gap:6, marginBottom:18}}
+      >
+        <input
+          type="text"
+          placeholder="someone@example.com (comma- or space-separated)"
+          value={draft}
+          onChange={e => setDraft(e.target.value)}
+          disabled={busy}
+          style={{flex:1, padding:'6px 10px', border:'1px solid var(--border)', borderRadius:4, background:'var(--bg)', color:'var(--text)'}}
+        />
+        <button type="submit" className="primary" disabled={busy || !draft.trim()}>Add</button>
+      </form>
+
+      <div style={{display:'flex', gap:8, flexWrap:'wrap', marginBottom:8}}>
+        <button
+          type="button"
+          className="primary"
+          onClick={() => sendNow()}
+          disabled={!status || !status.configured || sending || recipients.length === 0}
+          title={recipients.length === 0 ? 'Add at least one recipient' : `Send digest now to ${recipients.length} recipient(s)`}
+        >
+          {sending ? 'Sending…' : `Send digest now${recipients.length ? ` (${recipients.length})` : ''}`}
+        </button>
+        <a href="/api/mail/digest/preview" target="_blank" rel="noreferrer">
+          <button type="button" className="ghost">Preview HTML</button>
+        </a>
+        <SendToOther onSend={(addr) => sendNow(addr)} disabled={!status || !status.configured || sending} />
+      </div>
+      <p className="meta" style={{fontSize:11, marginTop:8}}>
+        The digest scheduler runs at 21:00 IST daily. Click "Send digest now" to fire it immediately
+        to the saved recipients, or use "Send to other…" for a one-off test.
+      </p>
+    </>
+  );
+}
+
+function SendToOther({ onSend, disabled }) {
+  const [open, setOpen] = useState(false);
+  const [val, setVal] = useState('');
+  if (!open) return <button type="button" className="ghost" disabled={disabled} onClick={() => setOpen(true)}>Send to other…</button>;
+  return (
+    <form
+      onSubmit={(e) => { e.preventDefault(); if (val.trim()) { onSend(val.trim()); setOpen(false); setVal(''); } }}
+      style={{display:'flex', gap:6}}
+    >
+      <input
+        autoFocus
+        type="email"
+        placeholder="address@domain.com"
+        value={val}
+        onChange={e => setVal(e.target.value)}
+        style={{padding:'6px 10px', border:'1px solid var(--border)', borderRadius:4, background:'var(--bg)', color:'var(--text)', minWidth:240}}
+      />
+      <button type="submit" className="primary" disabled={!val.trim()}>Send</button>
+      <button type="button" className="ghost" onClick={() => { setOpen(false); setVal(''); }}>Cancel</button>
+    </form>
+  );
+}
+
 function Settings() {
   const [llm, setLlm] = useState({ enabled: false, model: '' });
   const SECTIONS = [
@@ -4341,6 +4561,7 @@ function Settings() {
     { id: 'analysts',   label: 'Analysts',     icon: 'analysts', desc: 'Industry analyst firms and feeds.' },
     { id: 'news',       label: 'Industry News',icon: 'feed',     desc: 'Security press outlets (Dark Reading, SecurityWeek…).' },
     { id: 'spoc',       label: 'SPOC',         icon: 'analysts', desc: 'Daily ticket sheet sync, download URL and read-tracker identity.' },
+    { id: 'email',      label: 'Email digest', icon: 'feed',     desc: 'Daily 21:00 IST mail \u2014 recipients, preview, send-now.' },
     { id: 'appearance', label: 'Appearance',   icon: 'sparkles', desc: 'Light or dark theme — applied instantly.' },
     { id: 'about',      label: 'About',        icon: 'shield',   desc: 'Build info and helpful links.' },
   ];
@@ -4411,6 +4632,7 @@ function Settings() {
             </div>
           )}
           {section === 'spoc' && <SpocSettingsPanel />}
+          {section === 'email' && <MailDigestSettingsPanel />}
           {section === 'appearance' && (
             <>
               <h3 style={{marginTop:0, display:'flex', alignItems:'center', gap:8}}><Icon name="sparkles" size={18} /> Appearance</h3>
