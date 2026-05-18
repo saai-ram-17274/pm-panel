@@ -350,6 +350,43 @@ function App() {
 }
 
 // === Reusable widgets =======================================================
+
+// DatePill — single-day filter chip used by SPOC + Feed tabs.
+// `value` is a YYYY-MM-DD string (or '') and `onChange(newValue)` fires when
+// the user picks/clears a date. Visual: a pill showing either "Any date" or
+// the formatted date; the native picker is invisibly overlaid for input.
+function DatePill({ value, onChange, placeholder = 'Any date', title = 'Filter by date' }) {
+  const label = (() => {
+    if (!value) return placeholder;
+    const [y, m, d] = value.split('-').map(Number);
+    if (!y || !m || !d) return value;
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    return dt.toLocaleDateString(undefined, { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric', timeZone: 'UTC' });
+  })();
+  return (
+    <label className={`date-pill${value ? ' active' : ''}`} title={title}>
+      <span className="dp-icon" aria-hidden="true">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>
+        </svg>
+      </span>
+      <span className="dp-label">{label}</span>
+      <input
+        type="date" value={value || ''}
+        onChange={e => onChange(e.target.value)}
+        aria-label={title}
+      />
+      {value && (
+        <button
+          type="button" className="dp-clear"
+          onClick={(e) => { e.preventDefault(); e.stopPropagation(); onChange(''); }}
+          title="Clear date" aria-label="Clear date"
+        >×</button>
+      )}
+    </label>
+  );
+}
+
 function LoadingState({ label = 'Loading…', sub = '', size = 'md', variant = 'card' }) {
   return (
     <div className={`loader loader-${size} loader-${variant}`} role="status" aria-live="polite">
@@ -1718,6 +1755,7 @@ function AnalystsHub() {
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState('all'); // 'all' | firm.id (string)
   const [search, setSearch] = useState('');
+  const [dateFilter, setDateFilter] = useState('');
 
   const load = useCallback(() => {
     setLoading(true);
@@ -1760,12 +1798,14 @@ function AnalystsHub() {
   const matchSearch = (it) => !q ||
     (it.title || '').toLowerCase().includes(q) ||
     (it.content || '').toLowerCase().includes(q);
+  const matchDate = (it) => !dateFilter || (it.published_at || it.fetched_at || '').slice(0, 10) === dateFilter;
   const visibleItems = useMemo(() => {
     const base = selected === 'all' ? items : items.filter(it => it.product_id === +selected);
     return base
       .filter(matchSearch)
+      .filter(matchDate)
       .sort((a, b) => (b.published_at || b.fetched_at || '').localeCompare(a.published_at || a.fetched_at || ''));
-  }, [selected, items, q]);
+  }, [selected, items, q, dateFilter]);
   const itemsCtl = usePaginated(visibleItems, { defaultSize: 25, sizes: [10, 25, 50, 100] });
 
   if (loading) return <LoadingState label="Loading analyst firms…" />;
@@ -1889,56 +1929,27 @@ function AnalystsHub() {
         <section className="analysts-content">
           {selected === 'all' ? (
             <>
-              {/* Overview: per-firm summary tiles */}
-              <div className="dash-grid" style={{ marginBottom: 20 }}>
+              {/* Overview: compact firm chips (click to filter to that firm) */}
+              <div className="firm-chip-row">
                 {firmStats.map(f => (
-                  <div
+                  <button
                     key={f.id}
-                    className="dash-widget"
-                    style={{ cursor: 'pointer' }}
+                    type="button"
+                    className={`firm-chip${f.itemCount === 0 ? ' empty' : ''}`}
                     onClick={() => setSelected(String(f.id))}
-                    title="View this firm's items"
+                    title={`${f.itemCount} item${f.itemCount === 1 ? '' : 's'} · ${f.last30} in last 30d`}
                   >
-                    <div className="row" style={{ justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 6 }}>
-                      <h4 style={{ margin: 0, fontSize: 14 }}>{f.name}</h4>
-                      {f.website && (
-                        <a href={f.website} target="_blank" rel="noopener noreferrer"
-                           onClick={e => e.stopPropagation()}
-                           style={{ color: 'var(--accent)', fontSize: 11 }}>Site ↗</a>
-                      )}
-                    </div>
-                    <div className="row" style={{ gap: 12, fontSize: 12, marginBottom: 8 }}>
-                      <span><strong>{f.itemCount}</strong> <span className="muted">items</span></span>
-                      <span><strong>{f.last30}</strong> <span className="muted">last 30d</span></span>
-                      <span><strong>{f.sourceCount}</strong> <span className="muted">feed{f.sourceCount === 1 ? '' : 's'}</span></span>
-                    </div>
-                    {f.latest ? (
-                      <div style={{ paddingTop: 8, borderTop: '1px solid var(--border)' }}>
-                        <div className="label" style={{ fontSize: 10 }}>LATEST</div>
-                        <div style={{ fontSize: 12.5, lineHeight: 1.4, marginTop: 2 }}>
-                          {f.latest.url
-                            ? <a href={f.latest.url} target="_blank" rel="noopener noreferrer"
-                                 onClick={e => e.stopPropagation()}
-                                 style={{ color: 'var(--text)' }}>{f.latest.title}</a>
-                            : f.latest.title}
-                        </div>
-                        <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>
-                          {fmtDate(f.latest.published_at || f.latest.fetched_at)} · {relativeDate(f.latest.published_at || f.latest.fetched_at)}
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="muted" style={{ fontSize: 12, fontStyle: 'italic', paddingTop: 8, borderTop: '1px solid var(--border)' }}>
-                        No items ingested yet. {f.sourceCount === 0 ? 'No feeds configured.' : 'Run "Refresh all analyst feeds" in Catalog.'}
-                      </div>
-                    )}
-                  </div>
+                    <span className="firm-chip-name">{f.name}</span>
+                    <span className="firm-chip-count">{f.itemCount}</span>
+                    {f.last30 > 0 && <span className="firm-chip-badge">+{f.last30}</span>}
+                  </button>
                 ))}
               </div>
 
               <ConferencesPanel firms={firms} />
 
               {/* Unified chronological feed */}
-              <div className="row" style={{ justifyContent: 'flex-end', alignItems: 'center', marginBottom: 8 }}>
+              <div className="row" style={{ justifyContent: 'flex-end', alignItems: 'center', gap: 8, marginBottom: 8 }}>
                 <input
                   type="text"
                   placeholder="Search title/content…"
@@ -1946,6 +1957,7 @@ function AnalystsHub() {
                   onChange={e => setSearch(e.target.value)}
                   style={{ width: 220 }}
                 />
+                <DatePill value={dateFilter} onChange={setDateFilter} title="Filter by published date" />
               </div>
               {visibleItems.length === 0 ? (
                 <div className="muted" style={{ padding: 20, textAlign: 'center', background: 'var(--panel-2)', borderRadius: 10 }}>
@@ -2017,15 +2029,18 @@ function AnalystsHub() {
               <ConferencesPanel firmId={selectedFirm.id} firmName={selectedFirm.name} firms={firms} />
 
               {/* This firm's published items */}
-              <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+              <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center', gap: 8, marginBottom: 8 }}>
                 <h3 style={{ margin: 0, fontSize: 15 }}>What {selectedFirm.name} has published</h3>
-                <input
-                  type="text"
-                  placeholder={`Search ${selectedFirm.name} items…`}
-                  value={search}
-                  onChange={e => setSearch(e.target.value)}
-                  style={{ width: 220 }}
-                />
+                <div className="row" style={{ gap: 8, alignItems: 'center' }}>
+                  <input
+                    type="text"
+                    placeholder={`Search ${selectedFirm.name} items…`}
+                    value={search}
+                    onChange={e => setSearch(e.target.value)}
+                    style={{ width: 220 }}
+                  />
+                  <DatePill value={dateFilter} onChange={setDateFilter} title="Filter by published date" />
+                </div>
               </div>
               {visibleItems.length === 0 ? (
                 <div className="muted" style={{ padding: 20, textAlign: 'center', background: 'var(--panel-2)', borderRadius: 10 }}>
@@ -2067,6 +2082,7 @@ function IndustryNewsHub() {
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [outlet, setOutlet] = useState('all'); // source.id or 'all'
+  const [dateFilter, setDateFilter] = useState('');
 
   const load = useCallback(() => {
     Promise.all([api.get('/products'), api.get('/sources'), api.get('/raw-items')])
@@ -2099,8 +2115,9 @@ function IndustryNewsHub() {
     let arr = items;
     if (outlet !== 'all') arr = arr.filter(it => String(it.source_id) === outlet);
     if (q) arr = arr.filter(it => (it.title || '').toLowerCase().includes(q) || (it.content || '').toLowerCase().includes(q));
+    if (dateFilter) arr = arr.filter(it => (it.published_at || it.fetched_at || '').slice(0, 10) === dateFilter);
     return arr.sort((a, b) => new Date(b.published_at || b.fetched_at) - new Date(a.published_at || a.fetched_at));
-  }, [items, outlet, q]);
+  }, [items, outlet, q, dateFilter]);
 
   const itemsCtl = usePaginated(visibleItems, { defaultPageSize: 25 });
   const [refreshing, setRefreshing] = useState(false);
@@ -2220,38 +2237,27 @@ function IndustryNewsHub() {
         <section className="analysts-content">
           {outlet === 'all' ? (
             <>
-              <div className="dash-grid" style={{ marginBottom: 20 }}>
-                {outletStats.map(s => (
-                  <div
-                    key={s.id}
-                    className="dash-widget"
-                    style={{ cursor: 'pointer' }}
-                    onClick={() => setOutlet(String(s.id))}
-                  >
-                    <div className="row" style={{ justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 6 }}>
-                      <h4 style={{ margin: 0, fontSize: 14 }}>{s.label || (s.url || '').replace(/^https?:\/\/(www\.)?/, '').split('/')[0]}</h4>
-                      {s.url && (
-                        <a href={s.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} style={{ color: 'var(--accent)', fontSize: 11 }}>Feed ↗</a>
-                      )}
-                    </div>
-                    <div className="row" style={{ gap: 12, fontSize: 12, marginBottom: 6 }}>
-                      <span><strong>{s.itemCount}</strong> <span className="muted">items</span></span>
-                      <span><strong>{s.last30}</strong> <span className="muted">last 30d</span></span>
-                    </div>
-                    {s.latest && (
-                      <div style={{ paddingTop: 8, borderTop: '1px solid var(--border)', fontSize: 12.5 }}>
-                        <div className="label" style={{ fontSize: 10 }}>LATEST</div>
-                        <div style={{ marginTop: 2 }}>
-                          {s.latest.url ? <a href={s.latest.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} style={{ color: 'var(--text)' }}>{s.latest.title}</a> : s.latest.title}
-                        </div>
-                        <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>{relativeDate(s.latest.published_at || s.latest.fetched_at)}</div>
-                      </div>
-                    )}
-                  </div>
-                ))}
+              <div className="firm-chip-row">
+                {outletStats.map(s => {
+                  const label = s.label || (s.url || '').replace(/^https?:\/\/(www\.)?/, '').split('/')[0];
+                  return (
+                    <button
+                      key={s.id}
+                      type="button"
+                      className={`firm-chip${s.itemCount === 0 ? ' empty' : ''}`}
+                      onClick={() => setOutlet(String(s.id))}
+                      title={`${s.itemCount} item${s.itemCount === 1 ? '' : 's'} · ${s.last30} in last 30d`}
+                    >
+                      <span className="firm-chip-name">{label}</span>
+                      <span className="firm-chip-count">{s.itemCount}</span>
+                      {s.last30 > 0 && <span className="firm-chip-badge">+{s.last30}</span>}
+                    </button>
+                  );
+                })}
               </div>
-              <div className="row" style={{ justifyContent: 'flex-end', alignItems: 'center', marginBottom: 8 }}>
+              <div className="row" style={{ justifyContent: 'flex-end', alignItems: 'center', gap: 8, marginBottom: 8 }}>
                 <input type="text" placeholder="Search title/content…" value={search} onChange={e => setSearch(e.target.value)} style={{ width: 220 }} />
+                <DatePill value={dateFilter} onChange={setDateFilter} title="Filter by published date" />
               </div>
             </>
           ) : (() => {
@@ -2262,9 +2268,12 @@ function IndustryNewsHub() {
                   <h2 style={{ margin: '0 0 4px' }}>{s ? (s.label || (s.url || '')) : 'Outlet'}</h2>
                   {s && s.url && <a href={s.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent)', fontSize: 12 }}>{s.url}</a>}
                 </div>
-                <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center', gap: 8, marginBottom: 8 }}>
                   <h3 style={{ margin: 0, fontSize: 15 }}>Recent stories</h3>
-                  <input type="text" placeholder="Search…" value={search} onChange={e => setSearch(e.target.value)} style={{ width: 200 }} />
+                  <div className="row" style={{ gap: 8, alignItems: 'center' }}>
+                    <input type="text" placeholder="Search…" value={search} onChange={e => setSearch(e.target.value)} style={{ width: 200 }} />
+                    <DatePill value={dateFilter} onChange={setDateFilter} title="Filter by published date" />
+                  </div>
                 </div>
               </>
             );
@@ -2825,6 +2834,7 @@ function Releases() {
     if (v) { delete window.pmReleasesFilterProduct; return String(v); }
     return '';
   });
+  const [dateFilter, setDateFilter] = useState('');
   const [error, setError] = useState(null);
   const load = () => {
     Promise.all([api.get('/releases'), api.get('/products')])
@@ -2840,7 +2850,10 @@ function Releases() {
     setEditing(null); load();
   };
   const del = async (id) => { if (confirm('Delete?')) { await api.del('/releases/' + id); load(); } };
-  const filtered = filter ? items.filter(r => r.product_id === +filter) : items;
+  const filtered = items.filter(r =>
+    (!filter || r.product_id === +filter) &&
+    (!dateFilter || (r.release_date || '').slice(0, 10) === dateFilter)
+  );
   const ctl = usePaginated(filtered);
   return (
     <>
@@ -2856,6 +2869,7 @@ function Releases() {
             searchPlaceholder="Search products…"
             options={products.map(p => ({ value: String(p.id), label: p.name, hint: p.vendor || (p.is_own ? 'Own product' : '') }))}
           />
+          <DatePill value={dateFilter} onChange={setDateFilter} title="Filter by release date" />
           <button onClick={() => setEditing({ product_id: String(products[0]?.id || ''), version: '', release_date: '', highlights: '', url: '' })}>+ Add release</button>
         </div>
       </div>
@@ -3976,45 +3990,6 @@ function SpocDashboard({ onOpenEntries }) {
           <div className="kpi-value">{s.total}</div>
           <div className="kpi-sub">{s.bySheet.length} sheet{s.bySheet.length === 1 ? '' : 's'}</div>
         </div>
-        <div className="kpi">
-          <div className="kpi-label">Trackers</div>
-          <div className="kpi-value">{s.trackerColumns.length}</div>
-          <div className="kpi-sub">people in the read panel</div>
-        </div>
-        <div className="kpi">
-          <div className="kpi-label">Fully read</div>
-          <div className="kpi-value" style={{color:'#22c55e'}}>{s.fullyRead}</div>
-          <div className="kpi-sub">all trackers acknowledged</div>
-        </div>
-        <div className="kpi">
-          <div className="kpi-label">Untouched</div>
-          <div className="kpi-value" style={{color:'#ef4444'}}>{s.untouched}</div>
-          <div className="kpi-sub">no one has read</div>
-        </div>
-        <div className="kpi">
-          <div className="kpi-label">Coverage</div>
-          <div className="kpi-value">{readPct}%</div>
-          <div className="kpi-sub">{s.totalReadEvents} / {s.totalReadSlots} slots read</div>
-        </div>
-      </div>
-
-      {/* Per-person read progress ------------------------------------- */}
-      <div className="spoc-card">
-        <h3>Read progress by person</h3>
-        <div className="bar-list">
-          {s.perPerson.map(p => (
-            <div key={p.person} className="bar-row">
-              <div className="bar-label" title={p.person}>{p.person}</div>
-              <div className="bar-track">
-                <div
-                  className="bar-fill"
-                  style={{ width: `${p.pct}%`, background: 'linear-gradient(90deg, var(--accent), var(--accent-2))' }}
-                />
-              </div>
-              <div className="bar-count">{p.read}/{s.total} <span className="muted small">({p.pct}%)</span></div>
-            </div>
-          ))}
-        </div>
       </div>
 
       {/* Aggregations grid -------------------------------------------- */}
@@ -4065,10 +4040,10 @@ function SpocEntries() {
   const [data, setData] = useState({ items: [], total: 0, fixedColumns: [], trackerColumns: [], sheets: [], me: '' });
   const [q, setQ] = useState('');
   const [sheet, setSheet] = useState('');
+  const [date, setDate] = useState('');
   const [page, setPage] = useState(1);          // 1-based to match Paginator
   const [pageSize, setPageSize] = useState(25); // user-configurable via Paginator
   const [err, setErr] = useState('');
-  const [pendingKey, setPendingKey] = useState(null); // ack_key+person being toggled
   const sizes = [10, 25, 50, 100];
 
   const effectiveSize = pageSize === 'all' ? Math.max(data.total, 1) : pageSize;
@@ -4077,11 +4052,12 @@ function SpocEntries() {
     const params = new URLSearchParams();
     if (q) params.set('q', q);
     if (sheet) params.set('sheet', sheet);
+    if (date) { params.set('from', date); params.set('to', date); }
     params.set('limit', effectiveSize);
     params.set('offset', (page - 1) * effectiveSize);
     api.get('/spoc?' + params.toString()).then(setData).catch(e => setErr(e.message));
   };
-  useEffect(() => { reload(); }, [q, sheet, page, pageSize]);
+  useEffect(() => { reload(); }, [q, sheet, date, page, pageSize]);
   useRefresh(reload);
 
   const pages = Math.max(1, Math.ceil(data.total / effectiveSize));
@@ -4092,46 +4068,6 @@ function SpocEntries() {
   // Synthetic ctl matching the shape consumed by <Paginator/>.
   const ctl = { total: data.total, page, pages, pageSize, setPage, setPageSize, sizes, start, end };
   const fixed = data.fixedColumns || [];
-  const trackers = data.trackerColumns || [];
-  const me = data.me || '';
-
-  // The source sheet already has a per-person status column ("Open" / "Read" /
-  // anything else). On top of that the user can override via /spoc/ack. Local
-  // override wins. No-login: any chip is clickable, the only effect is on the
-  // tracker DB.
-  const personStatus = (row, person) => {
-    const ack = (row.acks || []).find(a => a.person === person);
-    if (ack) return ack.status;
-    const v = row.data ? row.data[person] : null;
-    if (v == null || v === '') return 'unread';
-    const s = String(v).toLowerCase();
-    if (s === 'open' || s === 'pending' || s === 'todo') return 'unread';
-    return 'read';
-  };
-
-  const togglePerson = async (row, person) => {
-    const cur = personStatus(row, person);
-    const next = cur === 'read' ? 'unread' : 'read';
-    const key = `${row.ackKey}::${person}`;
-    setPendingKey(key);
-    // Optimistic UI: mutate the row's acks in-place so the chip flips instantly.
-    setData(prev => ({
-      ...prev,
-      items: prev.items.map(it => {
-        if (it.ackKey !== row.ackKey) return it;
-        const others = (it.acks || []).filter(a => a.person !== person);
-        return { ...it, acks: [...others, { ack_key: row.ackKey, person, status: next, updated_at: new Date().toISOString() }] };
-      }),
-    }));
-    try {
-      await api.post('/spoc/ack', { ackKey: row.ackKey, person, status: next });
-    } catch (e) {
-      window.toast && window.toast(e.message, 'error');
-      reload(); // restore truth from server on failure
-    } finally {
-      setPendingKey(null);
-    }
-  };
 
   return (
     <>
@@ -4150,6 +4086,7 @@ function SpocEntries() {
               {data.sheets.map(s => <option key={s} value={s}>{s}</option>)}
             </select>
           )}
+          <DatePill value={date} onChange={v => { setPage(1); setDate(v); }} title="Filter by Time column" />
         </div>
       </div>
 
@@ -4171,54 +4108,24 @@ function SpocEntries() {
             <thead>
               <tr>
                 {fixed.map(c => <th key={c.label}>{c.label}</th>)}
-                {trackers.length > 0 && <th>Read by</th>}
               </tr>
             </thead>
             <tbody>
-              {data.items.map(r => {
-                const readCount = trackers.reduce((n, p) => n + (personStatus(r, p) === 'read' ? 1 : 0), 0);
-                return (
-                  <tr key={r.id}>
-                    {fixed.map(c => {
-                      const isClip = c.label === 'Query Summary' || c.label === 'Query / Description';
-                      const isTime = c.label === 'Time';
-                      const isTicket = c.label === 'Ticket ID';
-                      const cls = isClip ? 'spoc-clip' : (isTime ? 'time-cell' : '');
-                      return (
-                        <td key={c.label} className={cls} title={isClip ? String(r.data[c.key] || '') : undefined}>
-                          {isTicket ? <span className="ticket-id">{r.data[c.key] || ''}</span> : formatCell(r.data[c.key])}
-                        </td>
-                      );
-                    })}
-                    {trackers.length > 0 && (
-                      <td>
-                        <div className="spoc-readby">
-                          <span className="count">{readCount}/{trackers.length}</span>
-                          {trackers.map(p => {
-                            const status = personStatus(r, p);
-                            const isRead = status === 'read';
-                            const cls = ['spoc-chip'];
-                            if (isRead) cls.push('read');
-                            const pending = pendingKey === `${r.ackKey}::${p}`;
-                            return (
-                              <span
-                                key={p}
-                                className={cls.join(' ')}
-                                style={pending ? { opacity: .5, pointerEvents: 'none' } : undefined}
-                                title={`${p} — ${isRead ? 'read' : 'unread'} (click to toggle)`}
-                                onClick={() => togglePerson(r, p)}
-                              >
-                                <span className="avatar">{(p[0] || '?').toUpperCase()}</span>
-                                {p}
-                              </span>
-                            );
-                          })}
-                        </div>
+              {data.items.map(r => (
+                <tr key={r.id}>
+                  {fixed.map(c => {
+                    const isClip = c.label === 'Query Summary' || c.label === 'Query / Description';
+                    const isTime = c.label === 'Time';
+                    const isTicket = c.label === 'Ticket ID';
+                    const cls = isClip ? 'spoc-clip' : (isTime ? 'time-cell' : '');
+                    return (
+                      <td key={c.label} className={cls} title={isClip ? String(r.data[c.key] || '') : undefined}>
+                        {isTicket ? <span className="ticket-id">{r.data[c.key] || ''}</span> : formatCell(r.data[c.key])}
                       </td>
-                    )}
-                  </tr>
-                );
-              })}
+                    );
+                  })}
+                </tr>
+              ))}
             </tbody>
           </table>
         </div>
@@ -4835,6 +4742,7 @@ function Feed() {
     return '';
   });
   const [statusFilter, setStatusFilter] = useState('');
+  const [dateFilter, setDateFilter] = useState('');
   const load = () => {
     Promise.all([api.get('/products'), api.get('/raw-items'), api.get('/sources')])
       .then(([p, it, s]) => { setProducts(p); setItems(it); setSources(s); })
@@ -4910,7 +4818,8 @@ function Feed() {
   });
   const filtered = competitorItems.filter(it =>
     (!productFilter || it.product_id === +productFilter) &&
-    (!statusFilter || it.status === statusFilter)
+    (!statusFilter || it.status === statusFilter) &&
+    (!dateFilter || (it.published_at || it.fetched_at || '').slice(0, 10) === dateFilter)
   );
   const feedCtl = usePaginated(filtered, { defaultSize: 25, sizes: [10, 25, 50, 100] });
   const newCount = competitorItems.filter(i => i.status !== 'analyzed').length;
@@ -4984,7 +4893,8 @@ function Feed() {
             { value: 'new',      label: 'Pending',  hint: 'Awaiting analysis' },
           ]}
         />
-        {(productFilter || statusFilter) && <button className="ghost" onClick={()=>{setProductFilter('');setStatusFilter('');}}>Clear filters</button>}
+        <DatePill value={dateFilter} onChange={setDateFilter} title="Filter by published date" />
+        {(productFilter || statusFilter || dateFilter) && <button className="ghost" onClick={()=>{setProductFilter('');setStatusFilter('');setDateFilter('');}}>Clear filters</button>}
       </div>
 
       <div className="dash-widget">
@@ -5468,6 +5378,7 @@ function SchedulerCard({ onChange }) {
   const [status, setStatus] = useState(null);
   const [busy, setBusy] = useState(false);
   const [open, setOpen] = useState(true);
+  const [errorsModal, setErrorsModal] = useState(null); // { jobLabel, details: [...] }
 
   const load = async () => {
     try { setStatus(await api.get('/scheduler/status')); } catch (_) {}
@@ -5561,13 +5472,24 @@ function SchedulerCard({ onChange }) {
             <tbody>
               {status.jobs.map(j => {
                 const r = j.lastResult || {};
+                const errDetails = Array.isArray(r.errorDetails) ? r.errorDetails : [];
+                const showErrors = () => setErrorsModal({
+                  jobLabel: j.label,
+                  details: errDetails.length ? errDetails : (r.error ? [{ source: '(scheduler)', product: '', message: String(r.error) }] : []),
+                });
                 let resultCell;
                 if (r.skipped) resultCell = <span className="muted">skipped ({r.reason})</span>;
-                else if (r.error) resultCell = <span style={{color:'#f87171'}}>err: {String(r.error).slice(0,60)}</span>;
+                else if (r.error) resultCell = (
+                  <button className="link-danger" onClick={showErrors} title="Click to see the error">
+                    err: {String(r.error).slice(0,60)}{String(r.error).length > 60 ? '…' : ''}
+                  </button>
+                );
                 else if (j.lastRun) resultCell = (
                   <span>
                     <strong>{r.inserted ?? 0}</strong> new · <strong>{r.analyzed ?? 0}</strong> analyzed
-                    {r.errors ? <> · <span style={{color:'#f59e0b'}}>{r.errors} err</span></> : null}
+                    {r.errors ? <> · {errDetails.length
+                        ? <button className="link-danger" onClick={showErrors} title="Click to see what failed">{r.errors} err</button>
+                        : <span style={{color:'#f59e0b'}}>{r.errors} err</span>}</> : null}
                   </span>
                 );
                 else resultCell = <span className="muted">—</span>;
@@ -5585,6 +5507,40 @@ function SchedulerCard({ onChange }) {
             </tbody>
           </table>
         </div>
+      )}
+      {errorsModal && (
+        <Modal onClose={() => setErrorsModal(null)}>
+          <div style={{ maxWidth: 640 }}>
+            <h3 style={{ margin: '0 0 4px' }}>Errors — {errorsModal.jobLabel}</h3>
+            <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
+              {errorsModal.details.length} source{errorsModal.details.length === 1 ? '' : 's'} failed in the last run.
+            </p>
+            {errorsModal.details.length === 0 ? (
+              <p className="muted">No detailed error information was captured for this run.</p>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 420, overflowY: 'auto' }}>
+                {errorsModal.details.map((d, i) => (
+                  <div key={i} style={{
+                    padding: 10, borderRadius: 8,
+                    background: 'var(--panel-2)', border: '1px solid var(--border)',
+                    borderLeft: '3px solid #f87171',
+                  }}>
+                    <div style={{ fontSize: 13, fontWeight: 500 }}>
+                      {d.source}
+                      {d.product ? <span className="muted" style={{ fontWeight: 400 }}> · {d.product}</span> : null}
+                    </div>
+                    <div style={{ fontSize: 12.5, marginTop: 4, color: '#fca5a5', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                      {d.message}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="row" style={{ justifyContent: 'flex-end', marginTop: 14 }}>
+              <button className="ghost" onClick={() => setErrorsModal(null)}>Close</button>
+            </div>
+          </div>
+        </Modal>
       )}
     </div>
   );

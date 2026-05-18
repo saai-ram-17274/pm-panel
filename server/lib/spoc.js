@@ -452,19 +452,80 @@ async function runImport({ force = false, onProgress } = {}) {
            download, deleted };
 }
 
-function listEntries({ q = '', sheet = '', limit = 100, offset = 0 } = {}) {
+function listEntries({ q = '', sheet = '', from = '', to = '', limit = 100, offset = 0 } = {}) {
   const where = [];
   const params = [];
   if (sheet) { where.push('sheet = ?'); params.push(sheet); }
   if (q) { where.push('data_json LIKE ?'); params.push(`%${q}%`); }
   const wsql = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const total = db.prepare(`SELECT COUNT(*) c FROM spoc_entries ${wsql}`).get(...params).c;
-  const rows = db.prepare(
+
+  // Resolve the actual header used for the canonical "Time" column so we can
+  // date-filter on it. The header text varies across sheets (e.g. "Time",
+  // "Timestamp"), so we scan known keys and pick whatever maps to FIXED 'Time'.
+  let timeKey = null;
+  const sampleKeys = new Set();
+  for (const r of db.prepare('SELECT data_json FROM spoc_entries').all()) {
+    let d = {}; try { d = JSON.parse(r.data_json) || {}; } catch (_) {}
+    for (const k of Object.keys(d)) sampleKeys.add(k);
+  }
+  for (const k of sampleKeys) { if (matchFixed(k) === 'Time') { timeKey = k; break; } }
+
+  // Date filter is applied in JS (the data lives inside data_json). For
+  // correctness we pull ALL rows that match the SQL filter, drop the ones
+  // outside the date window, then paginate the remainder. The SPOC table is
+  // small (hundreds–low thousands of rows) so the extra scan is fine.
+  const allRows = db.prepare(
     `SELECT id, row_hash, sheet, data_json, source_file, first_seen, last_seen
      FROM spoc_entries ${wsql}
-     ORDER BY id DESC
-     LIMIT ? OFFSET ?`
-  ).all(...params, Math.min(500, +limit || 100), Math.max(0, +offset || 0));
+     ORDER BY id DESC`
+  ).all(...params);
+
+  // Pure calendar-day comparison — avoids all timezone math. We extract a
+  // YYYY-MM-DD string from each row's Time cell and string-compare against
+  // the filter bounds (which are already YYYY-MM-DD from <input type=date>).
+  //
+  // Formats seen in the wild for the Time column:
+  //   "2024-08-12"                     ISO (from xlsx dateNF)
+  //   "2024-08-12 14:32:15"            ISO with time
+  //   "12-08-2024", "12/08/2024 14:32" DD-MM-YYYY (Indian)
+  //   "16-May-2026 02:59:25"           DD-Mon-YYYY (most common in SPOC sheet)
+  const MONTHS = { jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',sept:'09',oct:'10',nov:'11',dec:'12' };
+  const cellDateStr = (raw) => {
+    if (raw == null || raw === '') return '';
+    const s = String(raw).trim();
+    let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+    m = s.match(/^(\d{1,2})[\/\- ]([A-Za-z]{3,9})[\/\- ](\d{4})/);
+    if (m) {
+      const mo = MONTHS[m[2].slice(0, 3).toLowerCase()];
+      if (mo) return `${m[3]}-${mo}-${String(m[1]).padStart(2,'0')}`;
+    }
+    m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+    if (m) return `${m[3]}-${String(m[2]).padStart(2,'0')}-${String(m[1]).padStart(2,'0')}`;
+    // Last resort: let Date parse it, then take its local YYYY-MM-DD.
+    const t = new Date(s);
+    if (!Number.isNaN(t.getTime())) {
+      const y = t.getFullYear(), mo = String(t.getMonth()+1).padStart(2,'0'), d = String(t.getDate()).padStart(2,'0');
+      return `${y}-${mo}-${d}`;
+    }
+    return '';
+  };
+  const fromStr = from && from.length >= 10 ? from.slice(0, 10) : '';
+  const toStr   = to   && to.length   >= 10 ? to.slice(0, 10)   : '';
+  const dateFiltered = (!fromStr && !toStr) ? allRows : allRows.filter(r => {
+    if (!timeKey) return true;
+    let d = {}; try { d = JSON.parse(r.data_json) || {}; } catch (_) {}
+    const ds = cellDateStr(d[timeKey]);
+    if (!ds) return false;
+    if (fromStr && ds < fromStr) return false;
+    if (toStr   && ds > toStr)   return false;
+    return true;
+  });
+
+  const total = dateFiltered.length;
+  const lim = Math.min(500, +limit || 100);
+  const off = Math.max(0, +offset || 0);
+  const rows = dateFiltered.slice(off, off + lim);
 
   // Discover person columns across the FULL dataset (not just this page) so
   // the tracker UI is stable as you paginate. A column is a "person" if it's

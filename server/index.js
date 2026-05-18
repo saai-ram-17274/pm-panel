@@ -42,6 +42,29 @@ function crud(resource, table, fields, opts = {}) {
 }
 
 crud('products', 'products', ['name', 'is_own', 'vendor', 'website', 'notes', 'kind', 'pros', 'cons', 'roadmap'], { orderBy: 'is_own DESC, name' });
+
+// Releases are only meaningful for real products (own + competitor). Analyst
+// firms and news sources sometimes get spurious release rows from the
+// analyzer when an article mentions a version number, so we filter them out
+// of the list/get endpoints here. POST/PUT/DELETE still go through the
+// generic crud helper below.
+app.get('/api/releases', (_req, res) => {
+  res.json(db.prepare(`
+    SELECT r.* FROM releases r
+    JOIN products p ON p.id = r.product_id
+    WHERE COALESCE(p.kind, 'product') = 'product'
+    ORDER BY r.release_date DESC, r.id DESC
+  `).all());
+});
+app.get('/api/releases/:id', (req, res) => {
+  const row = db.prepare(`
+    SELECT r.* FROM releases r
+    JOIN products p ON p.id = r.product_id
+    WHERE r.id = ? AND COALESCE(p.kind, 'product') = 'product'
+  `).get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  res.json(row);
+});
 crud('releases', 'releases', ['product_id', 'version', 'release_date', 'highlights', 'url'], { orderBy: 'release_date DESC' });
 crud('features', 'features', ['name', 'category', 'description'], { orderBy: 'category, name' });
 crud('feature-requests', 'feature_requests', ['feature_id', 'title', 'source_product_id', 'priority', 'status', 'notes'], { orderBy: 'created_at DESC' });
@@ -792,7 +815,11 @@ async function analyzeRawItem(itemId) {
 
   const extracted = await extractFeatures(item, product.name);
   let releaseId = null;
-  if (extracted.version || extracted.release_date) {
+  // Only real products have releases. Skip auto-creating release rows for
+  // analyst firms and news sources — their items live in the Feed sub-tabs,
+  // not under Releases.
+  const isProductKind = !product.kind || product.kind === 'product';
+  if (isProductKind && (extracted.version || extracted.release_date)) {
     const r = db.prepare(`INSERT INTO releases (product_id, version, release_date, highlights, url, auto_generated, raw_item_id) VALUES (?,?,?,?,?,1,?)`).run(
       product.id,
       extracted.version || 'unknown',
@@ -1101,8 +1128,29 @@ async function runScheduledJob(job) {
     }
     const out = await ingestRunAll({ product_kind: job.product_kind, auto: true });
     const inserted = (out.results || []).reduce((a, r) => a + (r.inserted || 0), 0);
-    const errors   = (out.results || []).filter(r => r.error).length;
+    const errorResults = (out.results || []).filter(r => r.error);
+    const errors   = errorResults.length;
     const sources  = (out.results || []).length;
+    // Capture per-source error messages so the Scheduler UI can show what
+    // actually failed instead of just a count. Look up the source label so
+    // the user sees a recognisable name.
+    let errorDetails = [];
+    if (errorResults.length) {
+      const ids = errorResults.map(r => r.source_id).filter(x => x != null);
+      const srcRows = ids.length
+        ? db.prepare(`SELECT s.id, s.label, s.url, p.name AS product_name FROM sources s JOIN products p ON p.id = s.product_id WHERE s.id IN (${ids.map(() => '?').join(',')})`).all(...ids)
+        : [];
+      const byId = Object.fromEntries(srcRows.map(r => [r.id, r]));
+      errorDetails = errorResults.map(r => {
+        const s = byId[r.source_id] || {};
+        return {
+          source_id: r.source_id,
+          source: s.label || s.url || `source #${r.source_id}`,
+          product: s.product_name || '',
+          message: String(r.error || '').slice(0, 500),
+        };
+      });
+    }
     writeJson(schedulerSettingKey(job.key, 'lastresult'), {
       startedAt, finishedAt: Date.now(),
       sources, inserted, errors,
@@ -1110,6 +1158,7 @@ async function runScheduledJob(job) {
       requirements: out.analysis?.requirements || 0,
       releases: out.analysis?.releases || 0,
       aborted: out.analysis?.aborted || false,
+      errorDetails,
     });
     console.log(`[scheduler] ${job.key}: ${sources} sources · ${inserted} new · ${out.analysis?.analyzed||0} analyzed${errors?` · ${errors} err`:''}`);
   } catch (e) {
@@ -1215,6 +1264,8 @@ app.get('/api/spoc', (req, res) => {
     const out = spoc.listEntries({
       q: req.query.q || '',
       sheet: req.query.sheet || '',
+      from: req.query.from || '',
+      to: req.query.to || '',
       limit: req.query.limit,
       offset: req.query.offset,
     });
