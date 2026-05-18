@@ -93,9 +93,9 @@ function build({ hours = 24 } = {}) {
   const recent = (s.recent || []).slice(0, 8);
 
   const sections = {
-    competitive: recentFeedItems('product', 5, hours),
-    analyst: recentFeedItems('analyst', 5, hours),
-    news: recentFeedItems('news', 5, hours),
+    competitive: recentFeedItems('product', 15, hours),
+    analyst: recentFeedItems('analyst', 15, hours),
+    news: recentFeedItems('news', 15, hours),
   };
 
   const css = `
