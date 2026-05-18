@@ -746,12 +746,22 @@ async function ingestRunAll({ product_id, product_kind, auto = true } = {}) {
 }
 
 app.post('/api/ingest/run-all', async (req, res) => {
+  const startedAt = Date.now();
+  const productKind = req.body?.product_kind;
   try {
     const out = await ingestRunAll({
       product_id: req.body?.product_id,
-      product_kind: req.body?.product_kind,
+      product_kind: productKind,
       auto: req.body?.auto !== false,
     });
+    // Refresh the matching Scheduler row(s) so a manual rerun clears any
+    // stale error from the previous scheduled run.
+    // Scoped to a single product (product_id) intentionally skips this — the
+    // scheduler row tracks full-kind polls, not single-product ones.
+    if (!req.body?.product_id) {
+      try { refreshSchedulerResultsFromIngest({ startedAt, out, productKind }); }
+      catch (e) { console.error('[scheduler] refresh after manual run-all failed:', e.message); }
+    }
     res.json(out);
   } catch (e) {
     if (e.code === 'BUSY') return res.status(409).json({ error: 'ingest already running', progress: ingestSnapshot() });
@@ -1122,6 +1132,65 @@ function nextRunFor(job) {
 function schedulerEnabled() { return readSettingRaw('scheduler_enabled') === '1'; }
 function setSchedulerEnabled(on) { writeSettingRaw('scheduler_enabled', on ? '1' : '0'); }
 
+// Build the scheduler `lastresult` payload for a given scheduler kind from a
+// raw ingestRunAll() output. If `productKind` is supplied, only results whose
+// source belongs to a product of that kind are counted (so manual run-all
+// invocations that span multiple kinds can refresh each scheduler row
+// independently). Analyze stats are attributed only to the 'product' kind
+// since autoAnalyzeIds() skips analyst/news items.
+function buildSchedulerPayloadFromIngest({ startedAt, out, productKind }) {
+  const allResults = out.results || [];
+  const allIds = allResults.map(r => r.source_id).filter(x => x != null);
+  const srcRows = allIds.length
+    ? db.prepare(`SELECT s.id, s.label, s.url, p.name AS product_name, COALESCE(p.kind,'product') AS kind
+                  FROM sources s JOIN products p ON p.id = s.product_id
+                  WHERE s.id IN (${allIds.map(() => '?').join(',')})`).all(...allIds)
+    : [];
+  const byId = Object.fromEntries(srcRows.map(r => [r.id, r]));
+  const filtered = productKind
+    ? allResults.filter(r => (byId[r.source_id]?.kind || 'product') === productKind)
+    : allResults;
+  if (!filtered.length) return null;
+  const inserted = filtered.reduce((a, r) => a + (r.inserted || 0), 0);
+  const errorResults = filtered.filter(r => r.error);
+  const errorDetails = errorResults.map(r => {
+    const s = byId[r.source_id] || {};
+    return {
+      source_id: r.source_id,
+      source: s.label || s.url || `source #${r.source_id}`,
+      product: s.product_name || '',
+      message: String(r.error || '').slice(0, 500),
+    };
+  });
+  const analyzeApplies = productKind === 'product' || productKind == null;
+  return {
+    startedAt, finishedAt: Date.now(),
+    sources: filtered.length, inserted, errors: errorResults.length,
+    analyzed: analyzeApplies ? (out.analysis?.analyzed || 0) : 0,
+    requirements: analyzeApplies ? (out.analysis?.requirements || 0) : 0,
+    releases: analyzeApplies ? (out.analysis?.releases || 0) : 0,
+    aborted: analyzeApplies ? (out.analysis?.aborted || false) : false,
+    errorDetails,
+  };
+}
+
+// Refresh scheduler `lastresult`/`lastrun` for every scheduler kind covered by
+// a manual /api/ingest/run-all invocation. This keeps the Scheduler UI in sync
+// with manual reruns so a previous error doesn't linger after a clean retry.
+function refreshSchedulerResultsFromIngest({ startedAt, out, productKind }) {
+  const targets = SCHEDULER_KINDS
+    .filter(j => typeof j.run !== 'function')
+    .filter(j => !productKind || j.product_kind === productKind);
+  for (const job of targets) {
+    const payload = buildSchedulerPayloadFromIngest({
+      startedAt, out, productKind: job.product_kind,
+    });
+    if (!payload) continue;
+    writeJson(schedulerSettingKey(job.key, 'lastresult'), payload);
+    writeSettingRaw(schedulerSettingKey(job.key, 'lastrun'), String(startedAt));
+  }
+}
+
 async function runScheduledJob(job) {
   const startedAt = Date.now();
   // Concurrency skip: don't persist lastrun so the job retries on the next tick.
@@ -1145,40 +1214,12 @@ async function runScheduledJob(job) {
       return;
     }
     const out = await ingestRunAll({ product_kind: job.product_kind, auto: true });
-    const inserted = (out.results || []).reduce((a, r) => a + (r.inserted || 0), 0);
-    const errorResults = (out.results || []).filter(r => r.error);
-    const errors   = errorResults.length;
-    const sources  = (out.results || []).length;
-    // Capture per-source error messages so the Scheduler UI can show what
-    // actually failed instead of just a count. Look up the source label so
-    // the user sees a recognisable name.
-    let errorDetails = [];
-    if (errorResults.length) {
-      const ids = errorResults.map(r => r.source_id).filter(x => x != null);
-      const srcRows = ids.length
-        ? db.prepare(`SELECT s.id, s.label, s.url, p.name AS product_name FROM sources s JOIN products p ON p.id = s.product_id WHERE s.id IN (${ids.map(() => '?').join(',')})`).all(...ids)
-        : [];
-      const byId = Object.fromEntries(srcRows.map(r => [r.id, r]));
-      errorDetails = errorResults.map(r => {
-        const s = byId[r.source_id] || {};
-        return {
-          source_id: r.source_id,
-          source: s.label || s.url || `source #${r.source_id}`,
-          product: s.product_name || '',
-          message: String(r.error || '').slice(0, 500),
-        };
-      });
-    }
-    writeJson(schedulerSettingKey(job.key, 'lastresult'), {
-      startedAt, finishedAt: Date.now(),
-      sources, inserted, errors,
-      analyzed: out.analysis?.analyzed || 0,
-      requirements: out.analysis?.requirements || 0,
-      releases: out.analysis?.releases || 0,
-      aborted: out.analysis?.aborted || false,
-      errorDetails,
-    });
-    console.log(`[scheduler] ${job.key}: ${sources} sources · ${inserted} new · ${out.analysis?.analyzed||0} analyzed${errors?` · ${errors} err`:''}`);
+    const payload = buildSchedulerPayloadFromIngest({
+      startedAt, out, productKind: job.product_kind,
+    }) || { startedAt, finishedAt: Date.now(), sources: 0, inserted: 0, errors: 0,
+            analyzed: 0, requirements: 0, releases: 0, aborted: false, errorDetails: [] };
+    writeJson(schedulerSettingKey(job.key, 'lastresult'), payload);
+    console.log(`[scheduler] ${job.key}: ${payload.sources} sources · ${payload.inserted} new · ${payload.analyzed} analyzed${payload.errors?` · ${payload.errors} err`:''}`);
   } catch (e) {
     writeJson(schedulerSettingKey(job.key, 'lastresult'), {
       startedAt, finishedAt: Date.now(), error: e.message || String(e),

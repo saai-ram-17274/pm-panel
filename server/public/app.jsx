@@ -4706,6 +4706,7 @@ function Catalog({ embedded = false }) {
   const delSource = async (id) => { if (confirm('Delete source?')) { await api.del('/sources/' + id); load(); } };
   const runSource = async (s) => {
     setBusyKey('src' + s.id, true);
+    window.dispatchEvent(new Event('pm:job-started'));
     try {
       const r = await api.post(`/sources/${s.id}/run?auto=1`);
       const a = r.analysis;
@@ -4718,6 +4719,7 @@ function Catalog({ embedded = false }) {
   };
   const runAll = async () => {
     setBusyKey('all', true);
+    window.dispatchEvent(new Event('pm:job-started'));
     try {
       const r = await api.post('/ingest/run-all', { auto: true });
       const a = r.analysis;
@@ -4745,6 +4747,7 @@ function Catalog({ embedded = false }) {
 
   const analyzePending = async () => {
     setBusyKey('pending', true);
+    window.dispatchEvent(new Event('pm:job-started'));
     try {
       const r = await api.post('/ingest/analyze-pending', { limit: 200 });
       window.toast(`Analyzed ${r.analyzed} · ${r.releases} release${r.releases===1?'':'s'} · ${r.requirements} gap${r.requirements===1?'':'s'}${r.errors?` · ${r.errors} err`:''}${r.pending?` · ${r.pending} still pending`:''}`, 'success');
@@ -4977,6 +4980,7 @@ function Feed() {
 
   const pollAll = async () => {
     setBusyKey('all', true);
+    window.dispatchEvent(new Event('pm:job-started'));
     try {
       const r = await api.post('/ingest/run-all', { auto: true });
       const a = r.analysis;
@@ -4989,6 +4993,7 @@ function Feed() {
   const pollOneSource = async (srcId) => {
     if (!srcId) return;
     setBusyKey('src' + srcId, true);
+    window.dispatchEvent(new Event('pm:job-started'));
     try {
       const r = await api.post(`/sources/${srcId}/run?auto=1`);
       const a = r.analysis;
@@ -5478,7 +5483,24 @@ function AnalyzeProgressBar() {
       }
     };
     poll();
-    return () => { alive = false; if (timer) clearTimeout(timer); };
+    // When any UI action kicks off a job (Scheduler "Run now", catalog "Poll
+    // all", source-row fetch, analyze-pending, etc.) it fires a
+    // `pm:job-started` window event so we can poll immediately instead of
+    // waiting up to 4s for the idle-interval tick — important for small jobs
+    // (e.g. industry: 6 sources, ~5s) that would otherwise finish before the
+    // progress bar ever appeared.
+    const nudge = () => {
+      if (timer) { clearTimeout(timer); timer = null; }
+      // Tiny delay lets the POST hit the server and flip ingestJob.running
+      // before we read /api/ingest/all-progress.
+      timer = setTimeout(poll, 300);
+    };
+    window.addEventListener('pm:job-started', nudge);
+    return () => {
+      alive = false;
+      if (timer) clearTimeout(timer);
+      window.removeEventListener('pm:job-started', nudge);
+    };
   }, []);
 
   // Pick what to render: ingest first if active or recently-done-with-errors,
@@ -5626,6 +5648,7 @@ function SchedulerCard({ onChange }) {
     setBusy(true);
     try {
       await api.post(`/scheduler/run-now/${key}`, {});
+      window.dispatchEvent(new Event('pm:job-started'));
       window.toast(`Started ${key} poll — watch the progress bar`, 'info');
       setTimeout(load, 1500);
       onChange && onChange();
