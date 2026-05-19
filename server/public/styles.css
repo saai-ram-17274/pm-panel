@@ -3140,3 +3140,15 @@ a.icon-btn { text-decoration: none; }
 /* Make agg cards equal-height & same min so wrapping looks intentional */
 .spoc-grid-3 > .spoc-card { align-self: stretch; }
 .spoc-card .bar-list { min-height: 200px; }
+
+/* Feature Requests dashboard: cap at 3 columns so 6 cards form a clean
+   2×3 grid instead of leaving stragglers in a 4-wide auto-fit. */
+.fr-grid-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+}
+@media (max-width: 1000px) {
+  .fr-grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+}
+@media (max-width: 640px) {
+  .fr-grid-3 { grid-template-columns: 1fr !important; }
+}

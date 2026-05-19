@@ -5,6 +5,8 @@
 
 const db = require('../db');
 const spoc = require('./spoc');
+const mailer = require('./mailer');
+const dailyDigest = require('./daily-digest');
 
 const ROW_CAP = 50;
 const TEXT_CAP = 600;
@@ -557,6 +559,252 @@ const tools = [
       };
     },
   },
+  // ---------------------------------------------------------------- COMMUNICATION tools
+  // Sends the current chat conversation to one or more recipients via the
+  // configured Zoho Mail account. Recipients are restricted to an allow-list
+  // of trusted domains so the bot can't be tricked into spamming arbitrary
+  // addresses (prompt-injection defence).
+  {
+    name: 'send_chat_transcript',
+    description: 'Email the current chat conversation (this thread) to one or more recipients. Use ONLY when the user explicitly asks to email/send/mail the chat, transcript, conversation, or summary. Do NOT ask "are you sure?" in chat — just call this tool. By default it returns needs_confirmation and the UI shows a Yes/No dialog; the user confirms there. Recipients must be on the server allow-list. Does NOT send the daily product digest (that has its own scheduled job).',
+    parameters: {
+      type: 'object',
+      required: ['to'],
+      properties: {
+        to: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'One or more recipient email addresses. Must match domains on the server allow-list.',
+        },
+        subject: {
+          type: 'string',
+          description: 'Optional subject line. Defaults to "PM Panel chat transcript — <date>".',
+        },
+        note: {
+          type: 'string',
+          description: 'Optional short note from the user, prepended to the email body before the transcript.',
+        },
+        confirmed: {
+          type: 'boolean',
+          description: 'Internal flag set by the UI confirmation dialog. The chatbot must NOT set this — always leave it false/unset. When false, the tool returns needs_confirmation; the actual send happens after the user clicks Confirm in the dialog.',
+        },
+      },
+    },
+    run: async (args, ctx) => {
+      const { to, subject, note, confirmed } = args || {};
+      if (!mailer.isConfigured()) {
+        return { error: 'Mailer not configured (ZOHO_MAIL_* env vars missing). Tell the user to configure Settings → Mail Digest.' };
+      }
+      const recipients = Array.isArray(to) ? to : (to ? [to] : []);
+      const cleaned = recipients.map(s => String(s || '').trim()).filter(Boolean);
+      if (!cleaned.length) return { error: '`to` must be a non-empty array of email addresses.' };
+      const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      const bad = cleaned.filter(e => !emailRe.test(e));
+      if (bad.length) return { error: `Invalid email address(es): ${bad.join(', ')}` };
+
+      // Allow-list: explicit MAIL_ALLOWED_DOMAINS env var wins. Otherwise derive
+      // from the configured digest recipients + the sender address — those are
+      // implicitly trusted because an operator already set them.
+      const explicit = (process.env.MAIL_ALLOWED_DOMAINS || '')
+        .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+      let allowed = new Set(explicit);
+      if (!allowed.size) {
+        const savedTo = ctx && typeof ctx.getDailyRecipients === 'function'
+          ? (ctx.getDailyRecipients() || '') : '';
+        const envTo = process.env.ZOHO_MAIL_DAILY_TO || '';
+        const from = process.env.ZOHO_MAIL_FROM || '';
+        const seed = [savedTo, envTo, from].join(',').split(',').map(s => s.trim()).filter(Boolean);
+        for (const addr of seed) {
+          const m = addr.match(/@([^\s@]+)$/);
+          if (m) allowed.add(m[1].toLowerCase());
+        }
+      }
+      if (!allowed.size) {
+        return { error: 'No allow-list configured. Set MAIL_ALLOWED_DOMAINS in .env or add at least one digest recipient first.' };
+      }
+      const blocked = cleaned.filter(e => !allowed.has(e.split('@')[1].toLowerCase()));
+      console.log(`[send_chat_transcript] confirmed=${!!confirmed} to=${cleaned.join(',')} allowed=[${[...allowed].join(',')}] blocked=${blocked.length}`);
+      if (blocked.length) {
+        return { error: `Recipient(s) ${blocked.join(', ')} not allowed. Allowed domains: ${[...allowed].join(', ')}. Ask the user to choose a recipient on those domains, or have an admin add the domain to MAIL_ALLOWED_DOMAINS.` };
+      }
+
+      const messages = (ctx && Array.isArray(ctx.messages)) ? ctx.messages : [];
+      // Trim the trailing "please email this" exchange so the recipient sees
+      // the actual conversation, not the meta-request that triggered the send.
+      const sendIntentRe = /\b(e?-?mail|send|mail|forward)\b.*\b(chat|transcript|conversation|summary|thread|this|it)\b|\bsend_chat_transcript\b/i;
+      let cutoff = messages.length;
+      for (let i = 0; i < messages.length; i++) {
+        const m = messages[i];
+        if (m && m.role === 'user' && sendIntentRe.test(String(m.content || ''))) {
+          cutoff = i;
+          break;
+        }
+      }
+      const transcript = messages.slice(0, cutoff);
+      if (!transcript.length) return { error: 'No prior conversation to send — only the send-request itself.' };
+
+      const nowIso = new Date().toISOString();
+      const subj = (subject && String(subject).trim()) || `PM Panel chat transcript — ${nowIso.slice(0, 10)}`;
+
+      // Step 1: not confirmed yet — surface a confirmation request to the UI.
+      if (!confirmed) {
+        return {
+          needs_confirmation: true,
+          to: cleaned,
+          subject: subj,
+          note: note || null,
+          message_count: transcript.length,
+          message: `Awaiting user confirmation in the UI before sending to ${cleaned.join(', ')}. The UI will show a Yes/No dialog. Reply briefly to the user (one short sentence) letting them know to confirm in the dialog — do NOT ask them in chat.`,
+        };
+      }
+
+      // Step 2: confirmed — build HTML and send.
+      const esc = (s) => String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+      const turns = transcript.map(m => {
+        const role = m.role === 'assistant' ? 'Assistant' : m.role === 'user' ? 'User' : (m.role || 'system');
+        const colour = role === 'User' ? '#1f6feb' : role === 'Assistant' ? '#238636' : '#6e7681';
+        return `<div style="margin:0 0 14px 0;padding:10px 12px;border-left:3px solid ${colour};background:#f6f8fa;border-radius:4px;">
+            <div style="font-weight:600;color:${colour};font-size:12px;margin-bottom:4px;letter-spacing:0.3px;">${role.toUpperCase()}</div>
+            <div style="white-space:pre-wrap;word-wrap:break-word;color:#1f2328;">${esc(m.content || '').slice(0, 8000)}</div>
+          </div>`;
+      }).join('');
+
+      const html = `<!doctype html><html><body style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#1f2328;max-width:760px;margin:0 auto;padding:20px;">
+        <h2 style="margin:0 0 4px 0;">PM Panel chat transcript</h2>
+        <div style="color:#6e7681;font-size:12px;margin-bottom:16px;">Generated ${esc(nowIso)} · ${transcript.length} message${transcript.length === 1 ? '' : 's'}</div>
+        ${note ? `<div style="margin:0 0 16px 0;padding:10px 12px;background:#fff8c5;border:1px solid #d4a72c;border-radius:6px;"><strong>Note:</strong> ${esc(note)}</div>` : ''}
+        ${turns}
+        <hr style="border:none;border-top:1px solid #d0d7de;margin:20px 0;">
+        <div style="color:#6e7681;font-size:11px;">Sent by the PM Panel chatbot at the user's request.</div>
+      </body></html>`;
+
+      try {
+        const out = await mailer.sendMail({ to: cleaned, subject: subj, html });
+        return {
+          ok: true,
+          to: cleaned,
+          subject: subj,
+          messageId: (out && out.messageId) || null,
+          message: `Sent chat transcript (${transcript.length} message${transcript.length === 1 ? '' : 's'}) to ${cleaned.join(', ')}.`,
+        };
+      } catch (e) {
+        return { error: `sendMail failed: ${e.message}` };
+      }
+    },
+  },
+  // Sends the daily digest (SPOC tickets last 24h + competitive/analyst/news
+  // feed activity) on-demand. Use when the user says "send the digest",
+  // "email yesterday's data", "send last 24 hours summary", etc. This is the
+  // SAME content the 21:00 IST scheduled job sends — just triggered manually.
+  {
+    name: 'send_daily_digest',
+    description: 'Email the PM digest (a subset or all of: SPOC tickets in last N hours, Feature Requests in last N hours, Competitive feed, Analyst feed, Industry news feed) to one or more recipients. Use when the user asks to send "the digest", "the summary", "last 24 hours data", "yesterday\'s data", "the SPOC report", "the news", "the feeds", "the feature requests", or any subset like "only SPOC", "only news", "just the competitive items", "only feature requests". Pass the `sections` parameter to limit which blocks are included — e.g. ["spoc"] for SPOC only, ["fr"] for Feature Requests only, ["news"] for industry news only, ["competitive","analyst"] for both feeds. Omit `sections` (or pass all five) to send the full digest. By default returns needs_confirmation and the UI shows a Yes/No dialog. Recipients must be on the server allow-list.',
+    parameters: {
+      type: 'object',
+      required: ['to'],
+      properties: {
+        to: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'One or more recipient email addresses. Must match domains on the server allow-list.',
+        },
+        sections: {
+          type: 'array',
+          items: { type: 'string', enum: ['spoc', 'fr', 'competitive', 'analyst', 'news'] },
+          description: 'Which digest blocks to include. Allowed: spoc, fr, competitive, analyst, news. Omit to include all five. Pick a subset based on the user\'s wording — e.g. "only SPOC" → ["spoc"], "only feature requests" → ["fr"], "just the news" → ["news"], "competitive and analyst" → ["competitive","analyst"].',
+        },
+        hours: {
+          type: 'number',
+          description: 'Lookback window in hours. Defaults to 24.',
+        },
+        confirmed: {
+          type: 'boolean',
+          description: 'Internal flag set by the UI confirmation dialog. The chatbot must NOT set this — always leave it false/unset.',
+        },
+      },
+    },
+    run: async (args, ctx) => {
+      const { to, hours, sections, confirmed } = args || {};
+      if (!mailer.isConfigured()) {
+        return { error: 'Mailer not configured (ZOHO_MAIL_* env vars missing). Tell the user to configure Settings → Mail Digest.' };
+      }
+      const recipients = Array.isArray(to) ? to : (to ? [to] : []);
+      const cleaned = recipients.map(s => String(s || '').trim()).filter(Boolean);
+      if (!cleaned.length) return { error: '`to` must be a non-empty array of email addresses.' };
+      const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      const bad = cleaned.filter(e => !emailRe.test(e));
+      if (bad.length) return { error: `Invalid email address(es): ${bad.join(', ')}` };
+
+      // Same allow-list logic as send_chat_transcript.
+      const explicit = (process.env.MAIL_ALLOWED_DOMAINS || '')
+        .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+      let allowed = new Set(explicit);
+      if (!allowed.size) {
+        const savedTo = ctx && typeof ctx.getDailyRecipients === 'function'
+          ? (ctx.getDailyRecipients() || '') : '';
+        const envTo = process.env.ZOHO_MAIL_DAILY_TO || '';
+        const from = process.env.ZOHO_MAIL_FROM || '';
+        const seed = [savedTo, envTo, from].join(',').split(',').map(s => s.trim()).filter(Boolean);
+        for (const addr of seed) {
+          const m = addr.match(/@([^\s@]+)$/);
+          if (m) allowed.add(m[1].toLowerCase());
+        }
+      }
+      if (!allowed.size) {
+        return { error: 'No allow-list configured. Set MAIL_ALLOWED_DOMAINS in .env or add at least one digest recipient first.' };
+      }
+      const blocked = cleaned.filter(e => !allowed.has(e.split('@')[1].toLowerCase()));
+      const sectionList = Array.isArray(sections) && sections.length ? sections : null;
+      console.log(`[send_daily_digest] confirmed=${!!confirmed} to=${cleaned.join(',')} hours=${hours||24} sections=${(sectionList||['all']).join(',')} blocked=${blocked.length}`);
+      if (blocked.length) {
+        return { error: `Recipient(s) ${blocked.join(', ')} not allowed. Allowed domains: ${[...allowed].join(', ')}.` };
+      }
+
+      const hrs = Number.isFinite(+hours) && +hours > 0 ? Math.min(168, +hours) : 24;
+      const digest = dailyDigest.build({ hours: hrs, sections: sectionList });
+      const includedSections = digest.sections || ['spoc','fr','competitive','analyst','news'];
+
+      if (!confirmed) {
+        const s = digest.stats || {};
+        const feeds = s.feeds || {};
+        return {
+          needs_confirmation: true,
+          kind: 'digest',
+          to: cleaned,
+          subject: digest.subject,
+          hours: hrs,
+          sections: includedSections,
+          stats: {
+            spocLast24h: includedSections.includes('spoc')        ? (s.spocLast24h || 0) : null,
+            frLast24h:   includedSections.includes('fr')          ? (s.frLast24h   || 0) : null,
+            competitive: includedSections.includes('competitive') ? (feeds.product || 0) : null,
+            analyst:     includedSections.includes('analyst')     ? (feeds.analyst || 0) : null,
+            news:        includedSections.includes('news')        ? (feeds.news    || 0) : null,
+          },
+          message: `Awaiting user confirmation in the UI before sending the ${hrs}h digest (sections: ${includedSections.join(', ')}) to ${cleaned.join(', ')}. Reply with ONE short sentence asking them to confirm in the dialog.`,
+        };
+      }
+
+      try {
+        const out = await mailer.sendMail({
+          to: cleaned, subject: digest.subject, html: digest.html, text: digest.text,
+        });
+        return {
+          ok: true,
+          to: cleaned,
+          subject: digest.subject,
+          sections: includedSections,
+          messageId: (out && out.messageId) || null,
+          stats: digest.stats,
+          message: `Sent ${hrs}h digest (${includedSections.join(', ')}) to ${cleaned.join(', ')}.`,
+        };
+      } catch (e) {
+        return { error: `sendMail failed: ${e.message}` };
+      }
+    },
+  },
 ];
 
 const byName = Object.fromEntries(tools.map(t => [t.name, t]));
@@ -571,11 +819,11 @@ const toolSpecs = tools.map(t => ({
   },
 }));
 
-async function runTool(name, args) {
+async function runTool(name, args, ctx) {
   const tool = byName[name];
   if (!tool) return { error: `Unknown tool '${name}'` };
   try {
-    const out = await tool.run(args || {});
+    const out = await tool.run(args || {}, ctx || {});
     return out == null ? { ok: true } : out;
   } catch (e) {
     return { error: e.message };

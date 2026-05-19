@@ -9,7 +9,18 @@ const db = require('./db');
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.use(express.static(require('path').join(__dirname, 'public')));
+app.use(express.static(require('path').join(__dirname, 'public'), {
+  // app.jsx is transpiled in-browser by @babel/standalone, so a cached copy
+  // means the user runs stale code after a deploy. Serve all .jsx / .html
+  // files with no-cache so a normal reload always picks up the latest UI.
+  setHeaders: (res, filePath) => {
+    if (/\.(jsx|html)$/i.test(filePath)) {
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+    }
+  },
+}));
 
 const PORT = process.env.PORT || 4000;
 
@@ -322,6 +333,7 @@ const { ingestRss, ingestHtml, ingestManual } = require('./lib/ingest');
 const { extractFeatures, scoreImplementability } = require('./lib/analyzer');
 const llm = require('./lib/llm');
 const spoc = require('./lib/spoc');
+const featureRequests = require('./lib/feature-requests');
 const mailer = require('./lib/mailer');
 const dailyDigest = require('./lib/daily-digest');
 const chatTools = require('./lib/chat-tools');
@@ -329,6 +341,8 @@ const chatTools = require('./lib/chat-tools');
 // In-memory tracker for the SPOC import job so the UI can render a progress
 // bar while runImport (download → parse → DB write) is in flight.
 const spocJobs = new Map();
+// Same pattern for the Feature Request sheet import.
+const frJobs = new Map();
 
 crud('sources', 'sources', ['product_id', 'kind', 'url', 'label'], { orderBy: 'product_id, id DESC' });
 
@@ -516,6 +530,25 @@ app.post('/api/chat', async (req, res) => {
         `(1) call list_products to confirm X isn't already there, (2) call add_product with the exact ` +
         `name the user gave, (3) if the user provided or you can ask for a feed/release-notes URL, ` +
         `call add_source for it, (4) tell the user to click Refresh in the UI to start polling.\n\n` +
+        `You can also call TWO COMMUNICATION tools — pick the right one based on what the user wants emailed:\n` +
+        `  • send_chat_transcript — emails THIS conversation (the messages in the chat window). Use ONLY ` +
+        `when the user explicitly says "email/send/share this chat / this conversation / our discussion / the transcript".\n` +
+        `  • send_daily_digest — emails the PM digest. Has a "sections" parameter (any subset of ` +
+        `["spoc","competitive","analyst","news"]) so the user can ask for a slice. Examples: ` +
+        `"only SPOC data" → sections=["spoc"]; "just the news" → sections=["news"]; ` +
+        `"competitive and analyst feeds" → sections=["competitive","analyst"]; ` +
+        `"last 24 hours summary" / "the digest" / no specific subset → omit sections (full digest). ` +
+        `Use when the user asks to send aggregated workspace data, NOT the chat itself.\n` +
+        `If you are unsure which one they mean, ask ONE short clarifying question; do not guess. ` +
+        `DO NOT ASK "are you sure?" OR "shall I send it?" — just call the chosen tool with the recipient(s). ` +
+        `CRITICAL: the UI dialog only opens when you ACTUALLY INVOKE the tool. You must emit a function/tool ` +
+        `call this turn — never reply with text like "please confirm in the dialog" unless you also called ` +
+        `the tool in the same turn. If you only have text in your reply with no tool call, NO dialog appears ` +
+        `and the user is stuck.\n` +
+        `When the tool returns needs_confirmation, reply with ONE short sentence like ` +
+        `"I've prepared the email — please confirm in the dialog." Do not list recipients/contents again. ` +
+        `NEVER set the "confirmed" parameter yourself — leave it out. ` +
+        `If a tool returns an allow-list error, relay it verbatim.\n\n` +
         `=== ANTI-HALLUCINATION RULES (HIGHEST PRIORITY) ===\n` +
         `1. GROUND EVERY CLAIM. Every product name, vendor, version, date, feature, gap, URL, count, ` +
         `or release detail in your reply MUST come from (a) the WORKSPACE SNAPSHOT block below, or ` +
@@ -562,6 +595,7 @@ app.post('/api/chat', async (req, res) => {
     const trace = [];
     const MAX_STEPS = 6;
     let final = '';
+    let pendingConfirmation = null;
     for (let step = 0; step < MAX_STEPS; step++) {
       const msg = await llm.chatRaw(convo, { tools: chatTools.toolSpecs, temperature: 0.1 });
       const toolCalls = msg.tool_calls || [];
@@ -573,10 +607,33 @@ app.post('/api/chat', async (req, res) => {
       });
       if (!toolCalls.length) {
         final = msg.content || '';
+        // Guard #1: did the model hallucinate the email-confirmation pattern
+        // ("please confirm in the dialog", "I've prepared the email", etc.)
+        // without ever calling send_chat_transcript / send_daily_digest?
+        // That happens because the system prompt teaches it the exact reply
+        // wording. If so, push back and let the loop continue.
+        const lastUser = [...messages].reverse().find(m => m.role === 'user')?.content || '';
+        const looksLikeEmailAck = /confirm in (the )?dialog|prepared the email|opened (the )?(dialog|confirmation)/i.test(final);
+        const askedToEmail = /\b(send|mail|email|forward|share)\b.*\b(to|@)\b/i.test(lastUser)
+          || /@[\w.-]+\.[a-z]{2,}/i.test(lastUser);
+        const calledEmailTool = trace.some(t => t.tool === 'send_chat_transcript' || t.tool === 'send_daily_digest');
+        if (looksLikeEmailAck && askedToEmail && !calledEmailTool) {
+          convo.push({
+            role: 'system',
+            content:
+              'STOP. You replied "please confirm in the dialog" but you DID NOT call any email tool ' +
+              'this turn. The UI dialog only appears when you actually invoke send_chat_transcript ' +
+              'or send_daily_digest. Discard your previous draft and call the correct tool NOW ' +
+              '(send_daily_digest for digest/summary/SPOC/feeds/news requests; send_chat_transcript ' +
+              'for "send this chat"). Pass the recipient address(es) the user named. Never set ' +
+              '"confirmed" yourself.',
+          });
+          final = '';
+          continue;
+        }
         // One-shot anti-hallucination guard: if the user asked something data-specific
         // but the model answered without ever consulting a tool, push back once and let
         // the loop continue. A "data-specific" question mentions concrete catalog terms.
-        const lastUser = [...messages].reverse().find(m => m.role === 'user')?.content || '';
         const looksDataSpecific = /\b(product|competitor|feature|gap|release|version|sentinel|splunk|qradar|securonix|chronicle|log360|exabeam|sumo|elastic|vendor|backlog|request|feed|article|ingest|category|since|coverage|matrix|analyst|gartner|forrester|spoc|ticket|customer|reseller|module|tracker|read|unread|saairam|abinayasri|athivignesh|insalatta|janapreethi|madathi|mari|pradeep|sakthi|sundar|surya)\b/i.test(lastUser);
         if (looksDataSpecific && trace.length === 0 && step === 0) {
           convo.push({
@@ -598,7 +655,27 @@ app.post('/api/chat', async (req, res) => {
         let args = {};
         try { args = tc.function?.arguments ? JSON.parse(tc.function.arguments) : {}; } catch (_) { args = {}; }
         const name = tc.function?.name;
-        const result = await chatTools.runTool(name, args);
+        // Context passed to write/communication tools that need more than just
+        // their JSON args (e.g. send_chat_transcript needs the chat history).
+        const toolCtx = { messages, getDailyRecipients };
+        const result = await chatTools.runTool(name, args, toolCtx);
+        // If a tool wants the UI to prompt the user before completing (e.g.
+        // send_chat_transcript), capture the request — the client will render
+        // a Yes/No dialog and call /api/mail/send-transcript on Confirm.
+        if (result && result.needs_confirmation && !pendingConfirmation) {
+          pendingConfirmation = {
+            tool: name,
+            args,
+            kind: result.kind || (name === 'send_daily_digest' ? 'digest' : 'transcript'),
+            to: result.to,
+            subject: result.subject,
+            note: result.note || null,
+            message_count: result.message_count,
+            hours: result.hours,
+            sections: result.sections || null,
+            stats: result.stats || null,
+          };
+        }
         trace.push({ step, tool: name, args, rows: Array.isArray(result) ? result.length : undefined });
         const payload = JSON.stringify(result);
         convo.push({
@@ -609,7 +686,7 @@ app.post('/api/chat', async (req, res) => {
       }
     }
     if (!final) final = '(I ran out of tool-call steps before producing an answer. Try asking a more specific question.)';
-    res.json({ reply: final, ...(debug ? { trace } : {}) });
+    res.json({ reply: final, ...(pendingConfirmation ? { pendingConfirmation } : {}), ...(debug ? { trace } : {}) });
   } catch (e) {
     console.error('chat error', e);
     res.status(500).json({ error: e.message });
@@ -1088,6 +1165,9 @@ const SCHEDULER_KINDS = [
   // Daily SPOC sheet sync. `hour` makes the slot daily-at-HH:MM instead of hourly-at-:MM.
   { key: 'spoc',     label: 'SPOC sheet sync',    minute: 10, hour: 0,
     run: async () => spoc.runImport() },
+  // Daily Feature Request sheet sync (10 min after SPOC).
+  { key: 'feature_requests', label: 'Feature Request sheet sync', minute: 20, hour: 0,
+    run: async () => featureRequests.runImport() },
   // Daily digest email. Defaults to 00:15 IST (right after SPOC sync at 00:10)
   // so the digest covers the freshly-imported sheet. The fire time is editable
   // from Settings → Email digest; the getters below read from `settings` on
@@ -1432,6 +1512,41 @@ app.post('/api/mail/send', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Confirmed send for the chatbot's email tools (send_chat_transcript and
+// send_daily_digest). The browser posts the cached confirmation payload here
+// after the user clicks "Confirm" in the inline dialog. Bypasses the LLM
+// entirely — we just call the underlying tool with confirmed=true.
+app.post('/api/mail/confirm-send', async (req, res) => {
+  try {
+    const { tool, to, subject, note, hours, sections, messages } = req.body || {};
+    const toolName = tool === 'send_daily_digest' ? 'send_daily_digest' : 'send_chat_transcript';
+    const args = toolName === 'send_daily_digest'
+      ? { to, hours: hours || 24, sections: Array.isArray(sections) ? sections : undefined, confirmed: true }
+      : { to, subject, note, confirmed: true };
+    const result = await chatTools.runTool(
+      toolName,
+      args,
+      { messages: Array.isArray(messages) ? messages : [], getDailyRecipients },
+    );
+    if (result && result.error) return res.status(400).json(result);
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Legacy alias kept for any in-flight clients.
+app.post('/api/mail/send-transcript', async (req, res) => {
+  try {
+    const { to, subject, note, messages } = req.body || {};
+    const result = await chatTools.runTool(
+      'send_chat_transcript',
+      { to, subject, note, confirmed: true },
+      { messages: Array.isArray(messages) ? messages : [], getDailyRecipients },
+    );
+    if (result && result.error) return res.status(400).json(result);
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ---------- SPOC ----------
 app.get('/api/spoc', (req, res) => {
   try {
@@ -1563,7 +1678,119 @@ app.get('/api/spoc/import-status/:jobId', (req, res) => {
     finishedAt: job.finishedAt,
     result: job.status === 'done' ? job.result : null,
     error: job.error,
-    log: job.log.slice(-20), // last 20 events
+    log: job.log.slice(-20),
+  });
+});
+
+// ---------- Feature Requests ----------
+// Mirrors the SPOC routes 1:1 — same shape so the UI can reuse the SPOC
+// settings/dashboard components with just a path swap.
+app.get('/api/fr', (req, res) => {
+  try {
+    res.json(featureRequests.listEntries({
+      q: req.query.q || '',
+      sheet: req.query.sheet || '',
+      from: req.query.from || '',
+      to: req.query.to || '',
+      limit: req.query.limit,
+      offset: req.query.offset,
+    }));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/fr/imports', (req, res) => {
+  try { res.json({ items: featureRequests.listImports({ limit: req.query.limit }) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/fr/summary', (req, res) => {
+  try { res.json(featureRequests.summary()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/fr/inbox', (req, res) => {
+  try { res.json(featureRequests.inboxStatus()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/fr/url', (req, res) => {
+  try {
+    const url = (req.body && typeof req.body.url === 'string') ? req.body.url.trim() : '';
+    featureRequests.setDownloadUrl(url);
+    res.json({ ok: true, downloadUrl: featureRequests.getDownloadUrl() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/fr/me', (req, res) => {
+  res.json({ me: featureRequests.getMe() });
+});
+app.post('/api/fr/me', (req, res) => {
+  try {
+    const me = (req.body && typeof req.body.me === 'string') ? req.body.me.trim() : '';
+    featureRequests.setMe(me);
+    res.json({ ok: true, me: featureRequests.getMe() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/fr/ack', (req, res) => {
+  try {
+    const { ackKey, person, status } = req.body || {};
+    res.json(featureRequests.setAck({ ackKey, person, status }));
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.post('/api/fr/import-now', async (req, res) => {
+  const force = !!(req.body && req.body.force);
+  const jobId = `fr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const job = {
+    id: jobId, status: 'running', stage: 'start', pct: 0, detail: 'queued',
+    startedAt: Date.now(), finishedAt: null, result: null, error: null, log: [],
+  };
+  frJobs.set(jobId, job);
+  (async () => {
+    try {
+      const result = await featureRequests.runImport({
+        force,
+        onProgress: (stage, pct, detail) => {
+          job.stage = stage;
+          if (typeof pct === 'number') job.pct = Math.max(job.pct, Math.min(100, Math.round(pct)));
+          if (detail) {
+            job.detail = detail;
+            job.log.push({ t: Date.now(), stage, pct: job.pct, detail });
+            if (job.log.length > 200) job.log.splice(0, job.log.length - 200);
+          }
+        },
+      });
+      job.result = result;
+      job.status = result && result.error ? 'error' : 'done';
+      if (result && result.error) job.error = result.error;
+      job.pct = 100;
+      job.stage = job.status === 'error' ? 'error' : 'done';
+      job.finishedAt = Date.now();
+    } catch (e) {
+      job.status = 'error'; job.stage = 'error'; job.error = e.message;
+      job.detail = e.message; job.pct = 100; job.finishedAt = Date.now();
+    } finally {
+      setTimeout(() => frJobs.delete(jobId), 5 * 60 * 1000).unref?.();
+    }
+  })();
+  if (req.query.wait === '1') {
+    const poll = () => new Promise(r => setTimeout(r, 200));
+    while (job.status === 'running') await poll();
+    return res.json({ jobId, ...job });
+  }
+  res.json({ jobId, status: job.status, stage: job.stage, pct: job.pct, detail: job.detail });
+});
+
+app.get('/api/fr/import-status/:jobId', (req, res) => {
+  const job = frJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'unknown jobId (may have expired)' });
+  res.json({
+    id: job.id, status: job.status, stage: job.stage, pct: job.pct, detail: job.detail,
+    startedAt: job.startedAt, finishedAt: job.finishedAt,
+    result: job.status === 'done' ? job.result : null,
+    error: job.error,
+    log: job.log.slice(-20),
   });
 });
 
@@ -1574,4 +1801,26 @@ app.get(/^\/(?!api\/).*/, (req, res, next) => {
   res.sendFile(require('path').join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, () => console.log(`PM Panel API on http://localhost:${PORT} (LLM: ${llm.hasToken() ? llm.getModel() : 'DISABLED — open Catalog → AI Settings'})`));
+app.listen(PORT, () => {
+  console.log(`PM Panel API on http://localhost:${PORT} (LLM: ${llm.hasToken() ? llm.getModel() : 'DISABLED — open Catalog → AI Settings'})`);
+  // Write our PID so the wrapper script (pm-panel.bat / pm-panel.sh) can
+  // reliably stop / status us without scanning for stray node.exe processes.
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    const pidFile = process.env.PM_PANEL_PID_FILE || path.join(__dirname, 'pm-panel.pid');
+    // Unlink first: on Windows, fs.writeFileSync to an existing file with the
+    // Hidden attribute fails with EPERM. Removing first sidesteps that.
+    try { fs.unlinkSync(pidFile); } catch (_) { /* not present */ }
+    fs.writeFileSync(pidFile, String(process.pid));
+    const cleanup = () => { try { fs.unlinkSync(pidFile); } catch (_) {} };
+    process.on('exit', cleanup);
+    process.on('SIGINT',  () => { cleanup(); process.exit(0); });
+    process.on('SIGTERM', () => { cleanup(); process.exit(0); });
+  } catch (e) {
+    console.warn('Could not write PID file:', e.message);
+  }
+}).on('error', (err) => {
+  console.error(`Failed to listen on port ${PORT}: ${err.code || ''} ${err.message}`);
+  process.exit(1);
+});

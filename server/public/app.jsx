@@ -45,11 +45,12 @@ const api = {
   del: (p) => fetch('/api' + p, { method: 'DELETE' }).then(r => r.json()),
 };
 
-const PAGES = ['Dashboard', 'Trends', 'Report', 'Feed', 'Releases', 'Matrix', 'Gaps', 'SPOC', 'Settings'];
+const PAGES = ['Dashboard', 'Trends', 'Report', 'Feed', 'Releases', 'Matrix', 'Gaps', 'SPOC', 'Feature Requests', 'Settings'];
 // URL routing: page name <-> URL slug. Each top-level page gets its own pretty URL.
 const PAGE_SLUGS = {
   Dashboard: 'dashboard', Trends: 'trends', Report: 'report', Feed: 'feed',
-  Releases: 'releases', Matrix: 'matrix', Gaps: 'gaps', SPOC: 'spoc', Settings: 'settings',
+  Releases: 'releases', Matrix: 'matrix', Gaps: 'gaps', SPOC: 'spoc',
+  'Feature Requests': 'feature-requests', Settings: 'settings',
 };
 const SLUG_TO_PAGE = Object.fromEntries(Object.entries(PAGE_SLUGS).map(([k, v]) => [v, k]));
 const pageFromPath = () => {
@@ -332,6 +333,7 @@ function App() {
           {page === 'Matrix' && <Matrix />}
           {page === 'Gaps' && <Gaps />}
           {page === 'SPOC' && <Spoc />}
+          {page === 'Feature Requests' && <FeatureRequests />}
           {page === 'Settings' && <Settings />}
         </ErrorBoundary>
       </main>
@@ -804,6 +806,7 @@ function DashboardHub() {
     { id: 'analysts',    label: 'Analyst' },
     { id: 'news',        label: 'News' },
     { id: 'spoc',        label: 'SPOC' },
+    { id: 'feature-requests', label: 'Feature Requests' },
   ];
   const [tab, setTab] = useSubRoute('dashboard', TABS.map(t => t.id), 'competitive');
   return (
@@ -834,6 +837,7 @@ function DashboardHub() {
       {tab === 'analysts'    && <AnalystDashboard />}
       {tab === 'news'        && <NewsDashboard />}
       {tab === 'spoc'        && <SpocDashboard onOpenEntries={() => window.pmNavigate && window.pmNavigate('SPOC')} />}
+      {tab === 'feature-requests' && <FeatureRequestsDashboard onOpenEntries={() => window.pmNavigate && window.pmNavigate('Feature Requests')} />}
     </>
   );
 }
@@ -4332,6 +4336,381 @@ function formatCell(v) {
   return s;
 }
 
+// ─── Feature Requests ───────────────────────────────────────────────────────
+// Mirrors the SPOC trio (dashboard / entries / settings panel) against the
+// /api/fr/* endpoints. The Feature Request sheet has no
+// per-person tracker columns, so there is no read/unread UI here — just the
+// table, dynamic dashboard breakdowns, and the standard download-URL +
+// "import now" settings.
+
+function FeatureRequestsDashboard({ onOpenEntries }) {
+  const [s, setS] = useState(null);
+  const [err, setErr] = useState('');
+  const reload = () => api.get('/fr/summary').then(setS).catch(e => setErr(e.message));
+  useEffect(() => { reload(); }, []);
+  useRefresh(reload);
+
+  if (err) return <div className="error-banner">{err}</div>;
+  if (!s) return <div className="muted" style={{padding:24}}>Loading Feature Request summary…</div>;
+  if (s.total === 0) {
+    return (
+      <div className="spoc-empty">
+        <p>No Feature Request entries yet.</p>
+        <p style={{fontSize:12}}>
+          Configure the download URL in <em>Settings → Feature Requests</em> and click <em>Import now</em>,
+          or wait for the daily 00:20 sync.
+        </p>
+      </div>
+    );
+  }
+
+  const TopList = ({ title, items, max = 8, colorFor }) => {
+    const top = items.slice(0, max);
+    const totalCount = items.reduce((n, i) => n + i.count, 0) || 1;
+    return (
+      <div className="spoc-card">
+        <h3>{title}</h3>
+        {top.length === 0 ? <p className="muted small">No data.</p> : (
+          <div className="bar-list">
+            {top.map(it => {
+              const pct = Math.round((it.count / totalCount) * 100);
+              const color = colorFor ? colorFor(it.label) : 'var(--accent)';
+              return (
+                <div key={it.label} className="bar-row">
+                  <div className="bar-label" title={it.label}>{it.label}</div>
+                  <div className="bar-track">
+                    <div className="bar-fill" style={{ width: `${pct}%`, background: color }} />
+                  </div>
+                  <div className="bar-count">{it.count}</div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const PRIORITY_COLOR = { p1: '#ef4444', p2: '#f59e0b', p3: '#22d3ee', p4: '#8b5cf6',
+                           high: '#ef4444', medium: '#f59e0b', low: '#22d3ee' };
+  const priorityColor = (label) => PRIORITY_COLOR[String(label).toLowerCase().replace(/\s+/g, '')] || 'var(--accent)';
+  const colorForDim = (key) => /priority|severity/i.test(key) ? priorityColor : undefined;
+
+  return (
+    <div className="spoc-dash">
+      <div className="toolbar">
+        <h2><Icon name="sparkles" size={22} /> Feature Requests Dashboard</h2>
+        <div className="row meta" style={{ fontSize: 12 }}><Icon name="clock" size={12} /> Updated {new Date().toLocaleTimeString()}</div>
+      </div>
+
+      <div className="spoc-kpis">
+        <div className="kpi">
+          <div className="kpi-label">Total requests</div>
+          <div className="kpi-value">{s.total}</div>
+          <div className="kpi-sub">{s.bySheet.length} sheet{s.bySheet.length === 1 ? '' : 's'} · {s.importsCount} import{s.importsCount === 1 ? '' : 's'}</div>
+        </div>
+      </div>
+
+      <div className="spoc-grid-3 fr-grid-3">
+        {[
+          ...s.dimensions.map(d => ({ title: `By ${d.label}`, items: d.items, colorFor: colorForDim(d.key) })),
+          ...(s.bySheet.length > 1 ? [{ title: 'By Sheet', items: s.bySheet }] : []),
+        ]
+          .filter(c => c.items && c.items.length > 0)
+          .slice(0, 6)
+          .map(c => <TopList key={c.title} title={c.title} items={c.items} colorFor={c.colorFor} />)}
+      </div>
+
+      <div className="spoc-card">
+        <div className="row" style={{justifyContent:'space-between', alignItems:'center', marginBottom:8}}>
+          <h3 style={{margin:0}}>Recently added</h3>
+          <button className="ghost small" onClick={onOpenEntries}>Open all entries →</button>
+        </div>
+        <div className="spoc-recent-list">
+          {s.recent.map(r => {
+            const link = r.messageLink || r.crmLink || '';
+            const linkLabel = r.messageLink ? 'Open chat ↗' : (r.crmLink ? 'Open CRM ↗' : '');
+            return (
+              <div key={r.ackKey} className="spoc-recent-row">
+                {link
+                  ? <a className="r-link" href={link} target="_blank" rel="noopener noreferrer" title={link}>{linkLabel}</a>
+                  : <span className="muted small">no link</span>}
+                <span className="r-summary" title={r.title}>
+                  {r.id ? <span className="ticket-id" style={{marginRight:8}}>{r.id}</span> : null}
+                  {r.title || <em className="muted">(no title)</em>}
+                </span>
+                <span className="muted small">{r.product || ''}{r.product && r.status ? ' · ' : ''}{r.status || ''}</span>
+                <span className="muted small time-cell">{r.time || ''}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FeatureRequests() {
+  return <FeatureRequestsEntries />;
+}
+
+function FeatureRequestsEntries() {
+  const [data, setData] = useState({ items: [], total: 0, fixedColumns: [], trackerColumns: [], sheets: [], me: '' });
+  const [q, setQ] = useState('');
+  const [sheet, setSheet] = useState('');
+  const [date, setDate] = useState('');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
+  const [err, setErr] = useState('');
+  const sizes = [10, 25, 50, 100];
+
+  const effectiveSize = pageSize === 'all' ? Math.max(data.total, 1) : pageSize;
+
+  const reload = () => {
+    const params = new URLSearchParams();
+    if (q) params.set('q', q);
+    if (sheet) params.set('sheet', sheet);
+    if (date) { params.set('from', date); params.set('to', date); }
+    params.set('limit', effectiveSize);
+    params.set('offset', (page - 1) * effectiveSize);
+    api.get('/fr?' + params.toString()).then(setData).catch(e => setErr(e.message));
+  };
+  useEffect(() => { reload(); }, [q, sheet, date, page, pageSize]);
+  useRefresh(reload);
+
+  const pages = Math.max(1, Math.ceil(data.total / effectiveSize));
+  useEffect(() => { if (page > pages) setPage(1); }, [pages, page]);
+  const start = (page - 1) * effectiveSize;
+  const end = Math.min(start + effectiveSize, data.total);
+  const ctl = { total: data.total, page, pages, pageSize, setPage, setPageSize, sizes, start, end };
+  const fixed = data.fixedColumns || [];
+
+  return (
+    <>
+      <div className="spoc-toolbar">
+        <div>
+          <h2>Feature Requests</h2>
+        </div>
+        <div className="controls">
+          <input
+            type="text" placeholder="Search any field…"
+            value={q} onChange={e => { setPage(1); setQ(e.target.value); }}
+          />
+          {data.sheets && data.sheets.length > 1 && (
+            <select value={sheet} onChange={e => { setPage(1); setSheet(e.target.value); }}>
+              <option value="">All sheets</option>
+              {data.sheets.map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+          )}
+          <DatePill value={date} onChange={v => { setPage(1); setDate(v); }} title="Filter by date column" />
+        </div>
+      </div>
+
+      {err && <div className="error-banner" style={{marginBottom:12}}>{err}</div>}
+
+      <Paginator ctl={ctl} label="entries" />
+
+      {data.items.length === 0 ? (
+        <div className="spoc-empty">
+          <p>No Feature Request entries yet.</p>
+          <p style={{fontSize:12}}>
+            Configure the download URL in <em>Settings → Feature Requests</em> and click <em>Import now</em>,
+            or wait for the daily 00:20 sync.
+          </p>
+        </div>
+      ) : (
+        <div className="spoc-table-wrap">
+          <table className="spoc-table">
+            <thead>
+              <tr>
+                {fixed.map(c => <th key={c.label}>{c.label}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {data.items.map(r => (
+                <tr key={r.id}>
+                  {fixed.map(c => {
+                    const lbl = c.label.toLowerCase();
+                    const isWrap = /title|summary|description|subject|notes|comment|query/.test(lbl);
+                    const isTime = /date|time/.test(lbl);
+                    const isId = /^(id|fr id|request id|ticket id|desk ticket id)$/.test(lbl);
+                    const cls = isTime ? 'time-cell' : '';
+                    const style = isWrap
+                      ? { whiteSpace: 'normal', wordBreak: 'break-word', maxWidth: 480, minWidth: 240 }
+                      : undefined;
+                    return (
+                      <td key={c.label} className={cls} style={style}>
+                        {isId ? <span className="ticket-id">{r.data[c.key] || ''}</span> : formatCell(r.data[c.key])}
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <Paginator ctl={ctl} label="entries" />
+    </>
+  );
+}
+
+function FeatureRequestsSettingsPanel() {
+  const [inbox, setInbox] = useState({ dir: '', files: [], downloadUrl: '' });
+  const [imports, setImports] = useState([]);
+  const [urlDraft, setUrlDraft] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [progress, setProgress] = useState(null);
+
+  const reload = () => {
+    api.get('/fr/inbox').then(r => { setInbox(r); setUrlDraft(r.downloadUrl || ''); }).catch(()=>{});
+    api.get('/fr/imports').then(r => setImports(r.items || [])).catch(()=>{});
+  };
+  useEffect(() => { reload(); }, []);
+  useRefresh(reload);
+
+  const saveUrl = async () => {
+    setBusy(true); setErr('');
+    try {
+      await api.post('/fr/url', { url: urlDraft });
+      window.toast && window.toast('Download URL saved', 'success');
+      reload();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const importNow = async (force = false) => {
+    setBusy(true); setErr('');
+    setProgress({ stage: 'start', pct: 0, detail: 'starting…', status: 'running' });
+    try {
+      const r = await api.post('/fr/import-now', { force });
+      const jobId = r && r.jobId;
+      if (!jobId) {
+        setProgress(null);
+        if (r.error) { setErr(r.error); window.toast && window.toast(r.error, 'error'); }
+        else if (r.skipped) { window.toast && window.toast(`Skipped: ${r.reason}`, 'info', 6000); }
+        else { window.toast && window.toast(`Imported ${r.rowsNew}/${r.rowsTotal} new rows from ${r.file}`, 'success'); }
+        reload();
+        return;
+      }
+      let final = null;
+      while (true) {
+        await new Promise(res => setTimeout(res, 500));
+        let s;
+        try { s = await api.get('/fr/import-status/' + jobId); }
+        catch (e) { setErr(e.message); break; }
+        setProgress({ stage: s.stage, pct: s.pct, detail: s.detail, status: s.status });
+        if (s.status !== 'running') { final = s; break; }
+      }
+      if (final) {
+        const result = final.result || {};
+        if (final.status === 'error' || result.error) {
+          const msg = final.error || result.error;
+          setErr(msg);
+          window.toast && window.toast(msg, 'error');
+        } else if (result.skipped) {
+          window.toast && window.toast(`Skipped: ${result.reason}`, 'info', 6000);
+        } else {
+          window.toast && window.toast(`Imported ${result.rowsNew}/${result.rowsTotal} new rows from ${result.file}`, 'success');
+        }
+        if (result.download && result.download.attempted && !result.download.ok) {
+          window.toast && window.toast(`Remote download: ${result.download.error}`, 'warn', 6000);
+        }
+      }
+      reload();
+    } catch (e) { setErr(e.message); }
+    finally {
+      setBusy(false);
+      setTimeout(() => setProgress(null), 1500);
+    }
+  };
+
+  return (
+    <>
+      <h3 style={{marginTop:0, display:'flex', alignItems:'center', gap:8}}><Icon name="sparkles" size={18} /> Feature Requests</h3>
+      <p className="meta" style={{fontSize:12, marginTop:-6}}>
+        Same workflow as SPOC — a daily share URL is downloaded from Zoho WorkDrive, parsed, and
+        merged into the database. Dedup uses an "ID" / "FR ID" / "Request ID" column when present,
+        falling back to a row hash. The scheduler runs daily at 00:20.
+      </p>
+
+      {err && <div className="error-banner" style={{margin:'8px 0'}}>{err}</div>}
+
+      <div style={{marginBottom:18}}>
+        <label style={{display:'block', fontSize:12, fontWeight:600, marginBottom:4}}>Download URL</label>
+        <div className="row" style={{gap:8, flexWrap:'wrap'}}>
+          <input
+            type="url" value={urlDraft} onChange={e => setUrlDraft(e.target.value)}
+            placeholder="https://workdrive.zohoexternal.in/external/.../download"
+            style={{flex:'1 1 360px', minWidth:280, padding:'6px 10px', fontFamily:'monospace', fontSize:12}}
+          />
+          <button className="ghost small" disabled={busy || urlDraft === (inbox.downloadUrl || '')} onClick={saveUrl}>Save URL</button>
+        </div>
+        <div className="muted" style={{fontSize:11, marginTop:4}}>
+          Stored in <code>settings.fr_download_url</code>. The scheduler runs daily at 00:20.
+        </div>
+      </div>
+
+      <div style={{marginBottom:18}}>
+        <label style={{display:'block', fontSize:12, fontWeight:600, marginBottom:4}}>Manual import</label>
+        <div className="row" style={{gap:8}}>
+          <button className="ghost" disabled={busy} onClick={() => importNow(false)}>{busy ? 'Importing…' : 'Import now'}</button>
+          <button className="ghost small" disabled={busy} onClick={() => importNow(true)} title="Re-parse even if the file's sha256 was already imported">Force re-import</button>
+        </div>
+        {progress && (
+          <div className="spoc-progress" style={{marginTop:10}}>
+            <div className="spoc-progress-head">
+              <span className="spoc-progress-stage">{stageLabel(progress.stage)}</span>
+              <span className="spoc-progress-pct">{progress.pct || 0}%</span>
+            </div>
+            <div className="spoc-progress-bar">
+              <div
+                className={'spoc-progress-fill' + (progress.status === 'error' ? ' err' : '') + (progress.status === 'done' ? ' ok' : '')}
+                style={{width: `${Math.max(2, progress.pct || 0)}%`}}
+              />
+            </div>
+            <div className="spoc-progress-detail" title={progress.detail || ''}>{progress.detail || ''}</div>
+          </div>
+        )}
+        <div className="muted" style={{fontSize:11, marginTop:4}}>
+          Watched folder: <code>{inbox.dir}</code>. Manually-dropped XLSX/CSV files are picked up too — newest wins.
+        </div>
+      </div>
+
+      <details style={{marginTop:12}}>
+        <summary style={{cursor:'pointer', fontWeight:600}}>Import history ({imports.length})</summary>
+        <table className="data-table" style={{width:'100%', marginTop:8, fontSize:12, borderCollapse:'collapse'}}>
+          <thead>
+            <tr>
+              <th style={thStyle}>When</th>
+              <th style={thStyle}>File</th>
+              <th style={thStyle}>Rows (total / new)</th>
+              <th style={thStyle}>Sheets</th>
+              <th style={thStyle}>SHA-256</th>
+            </tr>
+          </thead>
+          <tbody>
+            {imports.map(i => (
+              <tr key={i.id}>
+                <td style={tdStyle}>{i.imported_at}</td>
+                <td style={tdStyle}>{i.file_name}</td>
+                <td style={tdStyle}>{i.rows_total} / <strong>{i.rows_new}</strong></td>
+                <td style={tdStyle}>{(i.sheets || []).map(s => `${s.sheet}(${s.rows})`).join(', ')}</td>
+                <td style={{...tdStyle, fontFamily:'monospace', fontSize:11}}>{(i.file_sha256 || '').slice(0, 12)}…</td>
+              </tr>
+            ))}
+            {imports.length === 0 && (
+              <tr><td colSpan={5} style={{...tdStyle, textAlign:'center', color:'#888'}}>No imports yet.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </details>
+    </>
+  );
+}
+
 function MailDigestSettingsPanel() {
   const [status, setStatus] = useState(null);
   const [recipients, setRecipients] = useState([]);
@@ -4524,8 +4903,7 @@ function MailDigestSettingsPanel() {
         <SendToOther onSend={(addr) => sendNow(addr)} disabled={!status || !status.configured || sending} />
       </div>
       <p className="meta" style={{fontSize:11, marginTop:8}}>
-        The digest scheduler runs at 21:00 IST daily. Click "Send digest now" to fire it immediately
-        to the saved recipients, or use "Send to other…" for a one-off test.
+        The digest scheduler runs at {status && status.digestTime ? status.digestTime : timeDraft} IST daily.
       </p>
     </>
   );
@@ -4563,6 +4941,7 @@ function Settings() {
     { id: 'analysts',   label: 'Analysts',     icon: 'analysts', desc: 'Industry analyst firms and feeds.' },
     { id: 'news',       label: 'Industry News',icon: 'feed',     desc: 'Security press outlets (Dark Reading, SecurityWeek…).' },
     { id: 'spoc',       label: 'SPOC',         icon: 'analysts', desc: 'Daily ticket sheet sync, download URL and read-tracker identity.' },
+    { id: 'feature-requests', label: 'Feature Requests', icon: 'sparkles', desc: 'Daily Feature Request sheet sync from Zoho WorkDrive.' },
     { id: 'email',      label: 'Email digest', icon: 'feed',     desc: 'Daily 21:00 IST mail \u2014 recipients, preview, send-now.' },
     { id: 'appearance', label: 'Appearance',   icon: 'sparkles', desc: 'Light or dark theme — applied instantly.' },
     { id: 'about',      label: 'About',        icon: 'shield',   desc: 'Build info and helpful links.' },
@@ -4634,6 +5013,7 @@ function Settings() {
             </div>
           )}
           {section === 'spoc' && <SpocSettingsPanel />}
+          {section === 'feature-requests' && <FeatureRequestsSettingsPanel />}
           {section === 'email' && <MailDigestSettingsPanel />}
           {section === 'appearance' && (
             <>
@@ -5821,18 +6201,83 @@ function ChatBot() {
     setInput('');
     setBusy(true);
     try {
+      // Only real user/assistant turns go back to the LLM. Confirm cards and
+      // their resolution markers stay client-side.
+      const wirePayload = next
+        .filter(m => (m.role === 'user' || m.role === 'assistant') && !m.kind && m.content)
+        .map(m => ({ role: m.role, content: m.content }));
       const r = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: next.map(m => ({ role: m.role, content: m.content })) }),
+        body: JSON.stringify({ messages: wirePayload }),
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
-      setMessages([...next, { role: 'assistant', content: data.reply || '(empty reply)' }]);
+      const appended = [...next, { role: 'assistant', content: data.reply || '(empty reply)' }];
+      if (data.pendingConfirmation) {
+        appended.push({
+          role: 'assistant',
+          kind: 'confirm-send',
+          payload: data.pendingConfirmation,
+          status: 'pending',
+        });
+      }
+      setMessages(appended);
     } catch (e) {
       setMessages([...next, { role: 'assistant', content: '⚠ ' + e.message, error: true }]);
     } finally {
       setBusy(false);
+    }
+  };
+
+  // Called when the user clicks Confirm / Cancel inside a confirm-send card.
+  const resolveConfirmSend = async (cardIndex, accept) => {
+    const card = messages[cardIndex];
+    if (!card || card.kind !== 'confirm-send' || card.status !== 'pending') return;
+    if (!accept) {
+      const updated = messages.slice();
+      updated[cardIndex] = { ...card, status: 'cancelled' };
+      setMessages(updated);
+      return;
+    }
+    // Mark sending, then post the transcript directly (bypasses the LLM).
+    const sending = messages.slice();
+    sending[cardIndex] = { ...card, status: 'sending' };
+    setMessages(sending);
+    try {
+      const isDigest = (card.payload.tool === 'send_daily_digest') || card.payload.kind === 'digest';
+      // For chat-transcript sends we ship the conversation up to (but not
+      // including) the user's send-request so the recipient sees actual
+      // content. Digest sends don't need the chat history at all.
+      const history = isDigest ? [] : messages
+        .slice(0, cardIndex)
+        .filter(m => (m.role === 'user' || m.role === 'assistant') && !m.kind && m.content)
+        .map(m => ({ role: m.role, content: m.content }));
+      const r = await fetch('/api/mail/confirm-send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tool: card.payload.tool || (isDigest ? 'send_daily_digest' : 'send_chat_transcript'),
+          to: card.payload.to,
+          subject: card.payload.subject,
+          note: card.payload.note || undefined,
+          hours: card.payload.hours || undefined,
+          sections: card.payload.sections || undefined,
+          messages: history,
+        }),
+      });
+      const data = await r.json();
+      const done = messages.slice();
+      if (!r.ok || data.error) {
+        done[cardIndex] = { ...card, status: 'failed', error: data.error || ('HTTP ' + r.status) };
+      } else {
+        done[cardIndex] = { ...card, status: 'sent', result: data };
+      }
+      setMessages(done);
+    } catch (e) {
+      const failed = messages.slice();
+      failed[cardIndex] = { ...card, status: 'failed', error: e.message };
+      setMessages(failed);
     }
   };
 
@@ -5885,13 +6330,56 @@ function ChatBot() {
                 </div>
               </div>
             )}
-            {messages.map((m, i) => (
-              <div key={i} className={`chatbot-msg ${m.role} ${m.error ? 'error' : ''}`}>
-                {m.role === 'assistant' && !m.error
-                  ? <div className="chatbot-bubble markdown" dangerouslySetInnerHTML={renderChatMarkdown(m.content)} />
-                  : <div className="chatbot-bubble">{m.content}</div>}
-              </div>
-            ))}
+            {messages.map((m, i) => {
+              if (m.kind === 'confirm-send') {
+                const p = m.payload || {};
+                const recipients = Array.isArray(p.to) ? p.to.join(', ') : (p.to || '');
+                const isDigest = p.tool === 'send_daily_digest' || p.kind === 'digest';
+                const secs = Array.isArray(p.sections) && p.sections.length ? p.sections : ['spoc','competitive','analyst','news'];
+                const secLabel = secs.length === 4 ? 'all sections' : secs.join(', ');
+                const title = isDigest ? `Send ${p.hours || 24}h PM digest (${secLabel})?` : 'Send chat transcript?';
+                return (
+                  <div key={i} className="chatbot-msg assistant">
+                    <div className="chatbot-bubble" style={{ background:'#fff8c5', border:'1px solid #d4a72c', color:'#1f2328' }}>
+                      <div style={{ fontWeight:600, marginBottom:6 }}>{title}</div>
+                      <div style={{ fontSize:13, marginBottom:4 }}><strong>To:</strong> {recipients}</div>
+                      <div style={{ fontSize:13, marginBottom:4 }}><strong>Subject:</strong> {p.subject || '(default)'}</div>
+                      {isDigest && p.stats && (
+                        <div style={{ fontSize:13, marginBottom:10 }}>
+                          <strong>Contents:</strong>{' '}
+                          {[
+                            p.stats.spocLast24h != null ? `SPOC ${p.stats.spocLast24h}` : null,
+                            p.stats.competitive != null ? `Competitive ${p.stats.competitive}` : null,
+                            p.stats.analyst     != null ? `Analyst ${p.stats.analyst}`         : null,
+                            p.stats.news        != null ? `News ${p.stats.news}`               : null,
+                          ].filter(Boolean).join(' · ')}
+                        </div>
+                      )}
+                      {!isDigest && (
+                        <div style={{ fontSize:13, marginBottom:10 }}><strong>Messages:</strong> {p.message_count || 0}</div>
+                      )}
+                      {m.status === 'pending' && (
+                        <div className="row" style={{ gap:8 }}>
+                          <button className="primary small" onClick={() => resolveConfirmSend(i, true)}>Confirm &amp; Send</button>
+                          <button className="ghost small" onClick={() => resolveConfirmSend(i, false)}>Cancel</button>
+                        </div>
+                      )}
+                      {m.status === 'sending' && <div style={{ fontSize:12, color:'#6e7681' }}>Sending…</div>}
+                      {m.status === 'sent' && <div style={{ fontSize:12, color:'#1a7f37' }}>✓ Sent to {recipients}.</div>}
+                      {m.status === 'cancelled' && <div style={{ fontSize:12, color:'#6e7681' }}>Cancelled.</div>}
+                      {m.status === 'failed' && <div style={{ fontSize:12, color:'#cf222e' }}>⚠ {m.error || 'Send failed'}</div>}
+                    </div>
+                  </div>
+                );
+              }
+              return (
+                <div key={i} className={`chatbot-msg ${m.role} ${m.error ? 'error' : ''}`}>
+                  {m.role === 'assistant' && !m.error
+                    ? <div className="chatbot-bubble markdown" dangerouslySetInnerHTML={renderChatMarkdown(m.content)} />
+                    : <div className="chatbot-bubble">{m.content}</div>}
+                </div>
+              );
+            })}
             {busy && <div className="chatbot-msg assistant"><div className="chatbot-bubble typing"><span/><span/><span/></div></div>}
           </div>
           <div className="chatbot-input">
