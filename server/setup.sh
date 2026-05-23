@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
 # PM Panel one-time setup script (Linux/macOS)
-# Installs prerequisites: Node deps, rebuilds native modules, optional Playwright Chromium.
-# Usage: ./setup.sh [--with-playwright]
+# Installs prerequisites: Node deps, rebuilds native modules, Playwright headless Chromium.
+# Usage: ./setup.sh [--skip-playwright]
 
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-WITH_PLAYWRIGHT=0
+# Playwright headless-shell is required for the SPOC remote-download path.
+# Default ON; pass --skip-playwright to skip the ~120MB download.
+WITH_PLAYWRIGHT=1
 for arg in "$@"; do
   case "$arg" in
-    --with-playwright) WITH_PLAYWRIGHT=1 ;;
+    --skip-playwright|--no-playwright) WITH_PLAYWRIGHT=0 ;;
+    --with-playwright)                 WITH_PLAYWRIGHT=1 ;;
     -h|--help)
-      echo "Usage: $0 [--with-playwright]"
-      echo "  --with-playwright   Also install Playwright Chromium (for Zoho browser-download path)"
+      echo "Usage: $0 [--skip-playwright]"
+      echo "  (Playwright headless Chromium is installed by default for the SPOC remote-download path)"
+      echo "  --skip-playwright   Do not download the ~120MB headless-shell"
       exit 0 ;;
   esac
 done
@@ -72,14 +76,20 @@ else
   "$NPM_BIN" rebuild better-sqlite3 || { echo "ERROR: better-sqlite3 rebuild failed."; exit 1; }
 fi
 
-# 5) Optional: Playwright chromium
+# 5) Playwright headless Chromium (needed by the SPOC remote-download path).
+#    The runtime only ever calls chromium.launch({ headless: true }), which
+#    since Playwright 1.49+ uses chromium-headless-shell. Installing the
+#    headless-shell build (~120MB) instead of full chromium (~300MB).
 if (( WITH_PLAYWRIGHT == 1 )); then
   if [[ -d node_modules/playwright ]] || [[ -d node_modules/playwright-core ]]; then
-    echo "==> Installing Playwright Chromium..."
-    "$NPM_BIN" exec --yes -- playwright install chromium || echo "WARN: playwright install failed; Zoho browser-download path may not work."
+    echo "==> Installing Playwright headless Chromium..."
+    "$NPM_BIN" exec --yes -- playwright install chromium-headless-shell || echo "WARN: playwright install failed; SPOC remote-download path will not work."
   else
     echo "==> Skipping Playwright (package not in dependencies)."
   fi
+else
+  echo "==> Skipping Playwright per --skip-playwright. SPOC remote download will fail until you run:"
+  echo "    npx playwright install chromium-headless-shell"
 fi
 
 # 6) Inbox folder

@@ -317,7 +317,23 @@ function rowHash(sheet, normalised) {
 function parseFile(full) {
   const wb = xlsx.readFile(full, { cellDates: true, dateNF: 'yyyy-mm-dd' });
   const out = []; // { sheet, rows: [ {col: val, ...}, ... ] }
-  for (const sheetName of wb.SheetNames) {
+
+  // Only ingest sheets that look like SPOC. Several real-world download files
+  // bundle multiple sheets (e.g. "Feature Requests_SPOC.xlsx" has both a
+  // "SPOC" and a "Feature Requests" sheet). The Feature Requests sheet has a
+  // completely different column set (FR Name / CRM Link / Priority / etc.)
+  // and is handled by lib/feature-requests.js with its own table, so pulling
+  // those rows into spoc_entries mixes incompatible schemas and makes every
+  // SPOC row look like it's "missing" half its fields.
+  //
+  // Strategy:
+  //   1. Prefer sheets whose name contains "spoc" (case-insensitive).
+  //   2. If none match (single-sheet legacy file like "SPOC.xlsx" with
+  //      sheet name "Sheet1"), fall back to all sheets so we don't drop data.
+  const spocSheets = wb.SheetNames.filter(n => /spoc/i.test(n));
+  const namesToIngest = spocSheets.length ? spocSheets : wb.SheetNames;
+
+  for (const sheetName of namesToIngest) {
     const ws = wb.Sheets[sheetName];
     if (!ws) continue;
     // header:1 returns array-of-arrays so we can use the first non-empty row as headers.

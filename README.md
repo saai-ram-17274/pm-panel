@@ -82,6 +82,104 @@ Then open <http://localhost:4000>.
 
 ---
 
+## Run as a Windows service (recommended for production)
+
+`pm-panel.bat start` only lives as long as the launching shell. When you sign
+out of RDP, reboot, or close the console the Node process dies with it — which
+is why you may see "service is down" the morning after a logoff.
+
+For an always-on install, register PM Panel as a **Windows Scheduled Task**
+running under `SYSTEM`. The repo ships an installer:
+
+```powershell
+# From an *elevated* PowerShell
+cd C:\path\to\pm-panel\server
+powershell -ExecutionPolicy Bypass -File .\install-task.ps1
+```
+
+What it does:
+
+- Stops any currently-running `pm-panel.bat` instance and frees port 4000.
+- Writes a wrapper script (`run-service.ps1`) that `cd`s into `server\`, rotates
+  `pm-panel.log` when it crosses 5 MB, and runs `node index.js`.
+- Registers a Task Scheduler entry named **PM Panel**:
+  - Runs as `SYSTEM`, highest privileges.
+  - Trigger: **At system startup** + **Start when available** (catches missed
+    triggers if the box was off).
+  - Auto-restart on failure: every **1 minute**, up to **99 retries**.
+  - Runs on battery, no execution time limit.
+- Starts the task immediately and verifies port 4000 is listening.
+
+### Manage the service
+
+```powershell
+# Status
+Get-ScheduledTask -TaskName "PM Panel" | Select-Object State
+
+# Restart (after a code change, for example)
+Stop-ScheduledTask  -TaskName "PM Panel"
+Start-ScheduledTask -TaskName "PM Panel"
+
+# Tail the log
+Get-Content C:\path\to\pm-panel\server\pm-panel.log -Tail 50 -Wait
+
+# Remove the service entirely
+Unregister-ScheduledTask -TaskName "PM Panel" -Confirm:$false
+```
+
+> **Important:** once the scheduled task is installed, **do not** use
+> `pm-panel.bat start | stop | restart` — both would fight for port 4000.
+> Deploy code changes by stopping the task, editing, then starting it again.
+
+### Prerequisite: machine-wide Playwright browsers
+
+The SPOC sync downloads the Zoho WorkDrive XLSX via a headless Chromium driven
+by Playwright. By default `npx playwright install` drops the binaries under
+`%LOCALAPPDATA%\ms-playwright` of the user who ran the command — but the
+scheduled task runs as **SYSTEM**, whose profile lives at
+`C:\Windows\System32\config\systemprofile\AppData\Local\...`. SYSTEM cannot
+see binaries installed under the Administrator profile, so the SPOC job will
+fail every night with:
+
+```
+browserType.launch: Executable doesn't exist at ...chrome-headless-shell.exe
+Looks like Playwright was just installed or updated.
+Please run the following command to download new browsers:
+    npx playwright install
+```
+
+Fix once per machine: install the browsers to a shared location and tell
+Playwright to look there.
+
+```powershell
+# 1. Persist a machine-wide env var so SYSTEM also sees it
+[Environment]::SetEnvironmentVariable(
+  'PLAYWRIGHT_BROWSERS_PATH',
+  'C:\ProgramData\ms-playwright',
+  'Machine')
+
+# 2. Install for *this* shell session too, then download both Chromium variants
+$env:PLAYWRIGHT_BROWSERS_PATH = 'C:\ProgramData\ms-playwright'
+cd C:\path\to\pm-panel\server
+npx playwright install chromium
+npx playwright install chromium-headless-shell
+
+# 3. Restart the task so the new Node process picks up the env var
+Stop-ScheduledTask  -TaskName "PM Panel"
+Start-ScheduledTask -TaskName "PM Panel"
+```
+
+Verify:
+
+```powershell
+Test-Path 'C:\ProgramData\ms-playwright\chromium_headless_shell-*\chrome-headless-shell-win64\chrome-headless-shell.exe'
+```
+
+Should print `True`. From then on, both Administrator and SYSTEM share one
+browser install and SPOC sync runs cleanly under the daily 00:10 schedule.
+
+---
+
 ## Configuration
 
 All runtime config is via environment variables (optional):

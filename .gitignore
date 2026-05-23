@@ -86,3 +86,11 @@ coverage/
 *.zip
 *.tmp
 tmp/
+
+# Diagnostic / probe outputs from server/scripts
+*.out
+server/run-service.ps1
+server/playwright-install.log
+server/pm-panel.log
+server/pm-panel.*.log
+server/pm-panel.pid

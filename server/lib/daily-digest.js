@@ -16,32 +16,99 @@ function esc(s) {
 }
 
 function feedCounts(hours = 24) {
+  // Pull raw rows then de-dupe in JS using the same title-first key the
+  // tables use, so the card numbers match the table row counts exactly.
   const rows = db.prepare(`
-    SELECT COALESCE(p.kind, 'product') AS kind, COUNT(*) AS c
+    SELECT COALESCE(p.kind, 'product') AS kind, r.url, r.title
       FROM raw_items r
       JOIN products p ON p.id = r.product_id
      WHERE r.fetched_at >= datetime('now', ?)
-     GROUP BY COALESCE(p.kind, 'product')
   `).all(`-${hours} hours`);
-  const byKind = { product: 0, analyst: 0, news: 0 };
-  for (const r of rows) byKind[r.kind] = r.c;
-  return byKind;
+  const seenByKind = { product: new Set(), analyst: new Set(), news: new Set() };
+  for (const r of rows) {
+    const set = seenByKind[r.kind] || (seenByKind[r.kind] = new Set());
+    const t = String(r.title || '').trim().toLowerCase();
+    const key = (t && t.length > 5) ? ('t:' + t) : ('u:' + normUrl(r.url));
+    if (!key || key === 't:' || key === 'u:') continue;
+    set.add(key);
+  }
+  return {
+    product: (seenByKind.product || new Set()).size,
+    analyst: (seenByKind.analyst || new Set()).size,
+    news:    (seenByKind.news    || new Set()).size,
+  };
+}
+
+// Normalize a URL for dedup: lowercase, strip scheme, leading www., trailing
+// slash, query string, and fragment. So these all collapse to one key:
+//   https://www.crowdstrike.com/blog/foo/?utm_source=rss&x=1#bar
+//   http://crowdstrike.com/blog/foo
+//   https://crowdstrike.com/blog/foo/
+function normUrl(u) {
+  if (!u) return '';
+  let s = String(u).trim().toLowerCase();
+  s = s.replace(/^https?:\/\//, '').replace(/^www\./, '');
+  s = s.split('#')[0].split('?')[0];
+  s = s.replace(/\/+$/, '');
+  return s;
+}
+
+// De-dupe a list of feed items (rows returned by recentFeedItems) by
+// trimmed-lowercased TITLE (primary), falling back to normalized URL when
+// the title is missing/too-short. Title-first is more robust than URL-first
+// because publishers often:
+//   * mirror the same post at /blog/foo/ and /blog-uk/foo-localized/
+//   * rewrite links through tracking proxies (feeds.feedblitz.com vs
+//     feeds.fortinet.com) — different hostnames, same article
+// Titles tend to be byte-identical across these variants.
+// Keeps the FIRST occurrence — callers sort newest-first before passing in.
+function dedupeItems(items) {
+  const seen = new Set();
+  const out = [];
+  for (const it of items || []) {
+    const t = String(it.title || '').trim().toLowerCase();
+    const key = (t && t.length > 5) ? ('t:' + t) : ('u:' + normUrl(it.url));
+    if (!key || key === 't:' || key === 'u:') { out.push(it); continue; }
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(it);
+  }
+  return out;
 }
 
 function recentFeedItems(kind, limit = 5, hours = 24) {
-  // Industry-news items all share one umbrella product called "Industry News"
-  // — the actual outlet (Dark Reading, SecurityWeek, …) lives in sources.label.
-  // Prefer the source label when present so the digest shows the real outlet.
+  // De-dupe IN SQL using GROUP BY on the same title-first key feedCounts
+  // uses, so the LIMIT applies AFTER dedup. Otherwise a noisy feed (one
+  // article re-inserted 30+ times by a hot publisher) can crowd out every
+  // other unique article from the top-N window and the digest table ends
+  // up showing far fewer items than the card counter advertises.
   return db.prepare(`
-    SELECT r.id, r.title, r.url, r.published_at, r.fetched_at,
-           COALESCE(NULLIF(TRIM(s.label), ''), p.name) AS product
-      FROM raw_items r
-      JOIN products p ON p.id = r.product_id
- LEFT JOIN sources  s ON s.id = r.source_id
-     WHERE COALESCE(p.kind, 'product') = ?
-       AND r.fetched_at >= datetime('now', ?)
-     ORDER BY COALESCE(r.published_at, r.fetched_at) DESC
-     LIMIT ?
+    SELECT id, title, url, published_at, fetched_at, product FROM (
+      SELECT r.id, r.title, r.url, r.published_at, r.fetched_at,
+             COALESCE(NULLIF(TRIM(s.label), ''), p.name) AS product,
+             CASE
+               WHEN LENGTH(TRIM(LOWER(r.title))) > 5 THEN 't:' || TRIM(LOWER(r.title))
+               ELSE 'u:' || LOWER(REPLACE(REPLACE(REPLACE(REPLACE(
+                      COALESCE(r.url, ''),
+                      'https://', ''), 'http://', ''), 'www.', ''), '/', '/'))
+             END AS dedup_key,
+             ROW_NUMBER() OVER (
+               PARTITION BY
+                 CASE
+                   WHEN LENGTH(TRIM(LOWER(r.title))) > 5 THEN 't:' || TRIM(LOWER(r.title))
+                   ELSE 'u:' || LOWER(COALESCE(r.url, ''))
+                 END
+               ORDER BY COALESCE(r.published_at, r.fetched_at) DESC, r.id DESC
+             ) AS rn
+        FROM raw_items r
+        JOIN products p ON p.id = r.product_id
+   LEFT JOIN sources  s ON s.id = r.source_id
+       WHERE COALESCE(p.kind, 'product') = ?
+         AND r.fetched_at >= datetime('now', ?)
+    )
+    WHERE rn = 1
+    ORDER BY COALESCE(published_at, fetched_at) DESC
+    LIMIT ?
   `).all(kind, `-${hours} hours`, limit);
 }
 
@@ -224,10 +291,13 @@ function build({ hours = 24, sections: wantSections } = {}) {
     }</tbody></table>`;
   };
 
+  // Only show the "Latest activity" fallback table when the 24h window is
+  // empty — otherwise the two tables overlap almost entirely and the digest
+  // shows every ticket twice.
   const spocBlock = want('spoc') ? `
     <h2>SPOC</h2>
     ${last24Table}
-    ${recentSpoc}` : '';
+    ${last24.length ? '' : recentSpoc}` : '';
 
   // Feature Requests block — simple Product/Module · Title list, same shape
   // as the feed blocks below. Link is the CRM record (or chat link if any).

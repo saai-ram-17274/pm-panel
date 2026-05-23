@@ -140,6 +140,11 @@ const ICONS = {
   users:      'M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2 M9 11a4 4 0 100-8 4 4 0 000 8z M23 21v-2a4 4 0 00-3-3.87 M16 3.13a4 4 0 010 7.75',
   rocket:     'M4.5 16.5L3 19l5-1.5 M5 14l5 5 M16 3a13 13 0 00-9.27 8.27L4 14l6 6 2.73-2.73A13 13 0 0021 8l-2-2-3-3z M16 8a2 2 0 11-4 0 2 2 0 014 0z',
   search:     'M11 19a8 8 0 100-16 8 8 0 000 16z M21 21l-4.35-4.35',
+  plus:       'M12 5v14 M5 12h14',
+  minus:      'M5 12h14',
+  mail:       'M4 4h16a2 2 0 012 2v12a2 2 0 01-2 2H4a2 2 0 01-2-2V6a2 2 0 012-2z M22 6l-10 7L2 6',
+  bookmark:   'M19 21l-7-5-7 5V5a2 2 0 012-2h10a2 2 0 012 2v16z',
+  user:       'M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2 M12 11a4 4 0 100-8 4 4 0 000 8z',
 };
 
 function Icon({ name, size = 16, className = '', strokeWidth = 2, ...rest }) {
@@ -175,7 +180,7 @@ const PAGE_ICONS = {
   Releases:   'releases',
   Matrix:     'matrix',
   Gaps:       'gaps',
-  SPOC:       'analysts',
+  SPOC:       'user',
   Settings:   'settings',
 };
 
@@ -612,7 +617,10 @@ function Dashboard() {
       api.get('/analysis/summary'),
       api.get('/analysis/gaps'),
       api.get('/analysis/trends?months=6').catch(() => null),
-      api.get('/raw-items').catch(() => []),
+      // Pull the full competitive slice (server-side filter, raised limit) so
+      // the Feed-pulse "X analyzed / Y pending" counter reflects every
+      // competitor item, not just the most-recent 200 mixed-kind rows.
+      api.get('/raw-items?kind=product&own=0&exclude_source_kind=html&limit=2000').catch(() => []),
     ]).then(([d, g, t, r]) => { setData(d); setGaps(g); setTrends(t); setItems(r || []); })
       .catch(e => setError(e.message));
   }, []);
@@ -622,13 +630,16 @@ function Dashboard() {
   if (error) return <div className="empty-state"><Icon name="alert" size={28} /><p>Error: {error}</p></div>;
   if (!data) return <LoadingState label="Loading dashboard…" sub="Crunching products, gaps and recent activity" />;
 
-  // Latest activity = competitor entries from RSS / manual paste (matches Feed view).
-  // Own-product items and HTML page snapshots are kept in raw_items for the analyzer
-  // but are not "activity" worth surfacing here.
-  const activityItems = items.filter(i => !i.is_own_product && i.source_kind !== 'html');
+  // Items already arrive server-filtered to kind=product, own=0, no HTML
+  // snapshots — they're all the competitive activity. Recent slice for the
+  // "Latest activity" widget; counts for the Feed-pulse strip.
+  const activityItems = items;
   const recentItems = activityItems.slice(0, 6);
-  const pendingCount = items.filter(i => i.status === 'pending').length;
+  // Schema uses status='new' for items still awaiting analysis (and 'analyzed'
+  // once the LLM has run). The literal 'pending' string is only used in
+  // comments, so we treat anything not-yet-analyzed as pending.
   const analyzedCount = items.filter(i => i.status === 'analyzed').length;
+  const pendingCount  = items.length - analyzedCount;
 
   // Build per-month release count for sparklines
   const releaseSpark = (() => {
@@ -638,11 +649,25 @@ function Dashboard() {
     return Object.values(totals);
   })();
 
-  // Top categories by gap count (for donut)
+  // Top categories by gap count (for donut). Sort descending, take top N, and
+  // bucket the long tail into "Other (N more)" so the donut segments always
+  // sum to gaps.length (otherwise users see "871 gaps detected" but the donut
+  // adds up to less and looks wrong).
   const catBuckets = {};
   gaps.forEach(g => { const k = g.category || 'Other'; catBuckets[k] = (catBuckets[k]||0)+1; });
   const palette = ['#6366f1', '#8b5cf6', '#22d3ee', '#f59e0b', '#10b981', '#ef4444', '#ec4899'];
-  const donutSegs = Object.entries(catBuckets).slice(0, 6).map(([k,v], i) => ({ label: k, value: v, color: palette[i % palette.length] }));
+  const sortedCats = Object.entries(catBuckets).sort((a, b) => b[1] - a[1]);
+  const TOP_CATS = 6;
+  const donutSegs = (() => {
+    if (sortedCats.length <= TOP_CATS) {
+      return sortedCats.map(([k, v], i) => ({ label: k, value: v, color: palette[i % palette.length] }));
+    }
+    const top = sortedCats.slice(0, TOP_CATS - 1).map(([k, v], i) => ({ label: k, value: v, color: palette[i % palette.length] }));
+    const tail = sortedCats.slice(TOP_CATS - 1);
+    const tailSum = tail.reduce((n, [, v]) => n + v, 0);
+    top.push({ label: `Other (${tail.length} more)`, value: tailSum, color: palette[(TOP_CATS - 1) % palette.length] });
+    return top;
+  })();
 
   return (
     <>
@@ -1467,7 +1492,7 @@ function Analysts({ embedded = false }) {
         {!embedded && <h2><Icon name="analysts" size={22} /> Analyst Firms</h2>}
         {embedded && <h3 style={{margin:0, display:'flex', alignItems:'center', gap:8}}><Icon name="analysts" size={18} /> Analyst Firms</h3>}
         <div className="row">
-          <button className="ghost" onClick={() => setEditing({ name: '', vendor: '', website: '', notes: '', pros: '', cons: '', roadmap: '' })}>+ Add firm</button>
+          <button className="ghost" onClick={() => setEditing({ name: '', vendor: '', website: '', notes: '', pros: '', cons: '', roadmap: '' })}><Icon name="plus" size={14} /> Add firm</button>
           <button className="ghost" onClick={() => setPasting({ product_id: firms[0]?.id || '', title: '', content: '', url: '' })}>+ Paste report excerpt</button>
           <button onClick={fetchAll} disabled={busy.all || sources.length===0}>{busy.all ? 'Refreshing…' : <><Icon name="refresh" size={14}/> Refresh all analyst feeds</>}</button>
         </div>
@@ -1651,7 +1676,7 @@ function ConferencesPanel({ firmId, firmName, firms = [], compact = false }) {
             </button>
           )}
           <button className="ghost small" type="button" onClick={() => setEditing({ product_id: firmId || '', name: '', region: '', location: '', start_date: '', end_date: '', url: '', topics: '', notes: '' })}>
-            + Add
+            <Icon name="plus" size={12} /> Add
           </button>
         </div>
       </div>
@@ -1763,12 +1788,12 @@ function AnalystsHub() {
 
   const load = useCallback(() => {
     setLoading(true);
-    Promise.all([api.get('/products'), api.get('/sources'), api.get('/raw-items')])
+    Promise.all([api.get('/products'), api.get('/sources'), api.get('/raw-items?kind=analyst&limit=1000')])
       .then(([p, s, it]) => {
         const analystIds = new Set(p.filter(x => (x.kind || 'product') === 'analyst').map(x => x.id));
         setFirms(p.filter(x => (x.kind || 'product') === 'analyst'));
         setSources(s.filter(src => analystIds.has(src.product_id)));
-        setItems(it.filter(r => analystIds.has(r.product_id)));
+        setItems(it);
       })
       .catch(e => window.toast && window.toast(e.message, 'error'))
       .finally(() => setLoading(false));
@@ -2089,12 +2114,12 @@ function IndustryNewsHub() {
   const [dateFilter, setDateFilter] = useState('');
 
   const load = useCallback(() => {
-    Promise.all([api.get('/products'), api.get('/sources'), api.get('/raw-items')])
+    Promise.all([api.get('/products'), api.get('/sources'), api.get('/raw-items?kind=news&limit=1000')])
       .then(([p, s, it]) => {
         const newsIds = new Set(p.filter(x => (x.kind || 'product') === 'news').map(x => x.id));
         setFirms(p.filter(x => (x.kind || 'product') === 'news'));
         setSources(s.filter(src => newsIds.has(src.product_id)));
-        setItems(it.filter(r => newsIds.has(r.product_id)));
+        setItems(it);
       })
       .catch(e => window.toast && window.toast(e.message, 'error'))
       .finally(() => setLoading(false));
@@ -2378,7 +2403,7 @@ function IndustryNewsAdmin({ embedded = false }) {
         {!embedded && <h2><Icon name="feed" size={22} /> Industry News</h2>}
         {embedded && <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}><Icon name="feed" size={18} /> Industry News</h3>}
         <div className="row">
-          <button className="ghost" onClick={() => setEditing({ name: '', vendor: '', website: '', notes: '' })}>+ Add news firm</button>
+          <button className="ghost" onClick={() => setEditing({ name: '', vendor: '', website: '', notes: '' })}><Icon name="plus" size={14} /> Add news firm</button>
           <button onClick={fetchAll} disabled={busy.all || sources.length === 0}>{busy.all ? 'Fetching…' : <><Icon name="refresh" size={14} /> Fetch all</>}</button>
         </div>
       </div>
@@ -2778,7 +2803,7 @@ function Products() {
     <>
       <div className="toolbar">
         <h2>Products & Competitors</h2>
-        <button onClick={() => setEditing({ name: '', is_own: 0, vendor: '', website: '', notes: '', pros: '', cons: '', roadmap: '' })}>+ Add product</button>
+        <button onClick={() => setEditing({ name: '', is_own: 0, vendor: '', website: '', notes: '', pros: '', cons: '', roadmap: '' })}><Icon name="plus" size={14} /> Add product</button>
       </div>
       <table>
         <thead><tr><th>Name</th><th>Vendor</th><th>Pros</th><th>Cons</th><th>Roadmap / plans</th><th></th></tr></thead>
@@ -2874,7 +2899,7 @@ function Releases() {
             options={products.map(p => ({ value: String(p.id), label: p.name, hint: p.vendor || (p.is_own ? 'Own product' : '') }))}
           />
           <DatePill value={dateFilter} onChange={setDateFilter} title="Filter by release date" />
-          <button onClick={() => setEditing({ product_id: String(products[0]?.id || ''), version: '', release_date: '', highlights: '', url: '' })}>+ Add release</button>
+          <button onClick={() => setEditing({ product_id: String(products[0]?.id || ''), version: '', release_date: '', highlights: '', url: '' })}><Icon name="plus" size={14} /> Add release</button>
         </div>
       </div>
       {error && <p style={{color:'#f87171'}}>Error loading releases: {error}</p>}
@@ -3181,7 +3206,7 @@ function Requests() {
     <>
       <div className="toolbar">
         <h2>Requirements</h2>
-        <button onClick={() => setEditing({ title: '', priority: 'medium', status: 'open' })}>+ Add requirement</button>
+        <button onClick={() => setEditing({ title: '', priority: 'medium', status: 'open' })}><Icon name="plus" size={14} /> Add requirement</button>
       </div>
       <table>
         <thead><tr><th>Title</th><th>Linked feature</th><th>Source</th><th>Priority</th><th>Status</th><th>AI Confidence</th><th>Effort</th><th>Notes / Rationale</th><th></th></tr></thead>
@@ -3570,7 +3595,7 @@ function AISettingsPanel({ llm, onChange, forceOpen = false }) {
       <div className="ai-config">
         <div className="ai-section-title" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <span>API Tokens · fallback chain</span>
-          <button className="primary" onClick={() => setAdding(true)}>+ Add token</button>
+          <button className="primary" onClick={() => setAdding(true)}><Icon name="plus" size={14} /> Add token</button>
         </div>
         {tokens.length === 0 ? (
           <div className="muted" style={{ padding: '24px 8px', textAlign: 'center', fontSize: 13 }}>
@@ -3859,7 +3884,7 @@ function BookmarkletPanel() {
   return (
     <>
       <h3 style={{ marginTop: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
-        <Icon name="sparkles" size={18} /> Capture Bookmarklet
+        <Icon name="bookmark" size={18} /> Capture Bookmarklet
       </h3>
       <p className="meta" style={{ fontSize: 12, marginTop: -6 }}>
         For analyst content on sites that block automated fetching (Gartner, KuppingerCole, IDC, paywalled press releases),
@@ -3983,7 +4008,7 @@ function SpocDashboard({ onOpenEntries }) {
   return (
     <div className="spoc-dash">
       <div className="toolbar">
-        <h2><Icon name="analysts" size={22} /> SPOC Dashboard</h2>
+        <h2><Icon name="user" size={22} /> SPOC Dashboard</h2>
         <div className="row meta" style={{ fontSize: 12 }}><Icon name="clock" size={12} /> Updated {new Date().toLocaleTimeString()}</div>
       </div>
 
@@ -4242,7 +4267,7 @@ function SpocSettingsPanel() {
 
   return (
     <>
-      <h3 style={{marginTop:0, display:'flex', alignItems:'center', gap:8}}><Icon name="analysts" size={18} /> SPOC</h3>
+      <h3 style={{marginTop:0, display:'flex', alignItems:'center', gap:8}}><Icon name="user" size={18} /> SPOC</h3>
       <p className="meta" style={{fontSize:12, marginTop:-6}}>
         The SPOC tab pulls a daily ticket sheet from Zoho WorkDrive, dedupes by Ticket ID and lets each
         person mark which rows they've read. The fetcher uses headless Chromium to click the public-share
@@ -4738,21 +4763,40 @@ function MailDigestSettingsPanel() {
     if (!list.length) return;
     const bad = list.filter(e => !isEmail(e));
     if (bad.length) { window.toast && window.toast('Invalid email: ' + bad.join(', '), 'error'); return; }
-    const next = Array.from(new Set([...recipients, ...list]));
-    await save(next);
+    // Case-insensitive duplicate check against the already-saved recipients.
+    const existing = new Set(recipients.map(r => String(r).toLowerCase()));
+    const dupes = list.filter(e => existing.has(e.toLowerCase()));
+    const fresh = list.filter(e => !existing.has(e.toLowerCase()));
+    if (dupes.length && !fresh.length) {
+      window.toast && window.toast(
+        dupes.length === 1
+          ? `${dupes[0]} is already in the recipients list`
+          : `Already added: ${dupes.join(', ')}`,
+        'info');
+      setDraft('');
+      return;
+    }
+    if (dupes.length) {
+      window.toast && window.toast(`Skipped ${dupes.length} already-added: ${dupes.join(', ')}`, 'info');
+    }
+    const next = Array.from(new Set([...recipients, ...fresh]));
+    await save(next, fresh);
   };
   const removeRecipient = async (e) => {
     const next = recipients.filter(r => r !== e);
     await save(next);
   };
-  const save = async (next) => {
+  const save = async (next, added) => {
     setBusy(true);
     try {
       const r = await api.put('/mail/settings', { recipients: next });
       if (r.error) { window.toast && window.toast(r.error, 'error'); return; }
       setRecipients(r.recipients || []);
       setDraft('');
-      window.toast && window.toast('Saved', 'success');
+      const msg = Array.isArray(added) && added.length
+        ? (added.length === 1 ? `Added ${added[0]}` : `Added ${added.length} recipients`)
+        : 'Saved';
+      window.toast && window.toast(msg, 'success');
     } finally { setBusy(false); }
   };
   const sendNow = async (overrideTo) => {
@@ -4786,7 +4830,7 @@ function MailDigestSettingsPanel() {
   return (
     <>
       <h3 style={{marginTop:0, display:'flex', alignItems:'center', gap:8}}>
-        <Icon name="feed" size={18} /> Email digest
+        <Icon name="mail" size={18} /> Email digest
       </h3>
       <p className="meta" style={{fontSize:12, marginTop:-6}}>
         Daily digest sent at <strong>{status && status.digestTime ? `${status.digestTime} IST` : '—'}</strong>.
@@ -5351,7 +5395,11 @@ function Feed() {
   const [statusFilter, setStatusFilter] = useState('');
   const [dateFilter, setDateFilter] = useState('');
   const load = () => {
-    Promise.all([api.get('/products'), api.get('/raw-items'), api.get('/sources')])
+    // Server-side filter: kind=product (competitive only), exclude own
+    // products, exclude HTML page-snapshot sources, and bump the page size
+    // so the LIMIT doesn't crop the competitive slice down to ~20 once
+    // analyst+news rows mingle in by fetched-at.
+    Promise.all([api.get('/products'), api.get('/raw-items?kind=product&own=0&exclude_source_kind=html&limit=1000'), api.get('/sources')])
       .then(([p, it, s]) => { setProducts(p); setItems(it); setSources(s); })
       .catch(e => setError(e.message));
   };
@@ -5911,6 +5959,14 @@ function AnalyzeProgressBar() {
     if (errorKind === 'rate_limit') return kind === 'analyze'
       ? 'GitHub Models rate limit hit. Wait a few minutes and click Analyze pending again — already-analyzed items are kept.'
       : 'GitHub Models rate limit hit while analyzing fetched items.';
+    if (errorKind === 'source_rate_limit')
+      return 'A publisher rate-limited our poller. It will recover on the next run.';
+    if (errorKind === 'source_blocked')
+      return raw
+        ? `A source rejected our request (${raw.slice(0, 120)}). The AI tokens are fine — this is a publisher-side block.`
+        : 'A source rejected our request (HTTP 401/403). The AI tokens are fine — this is a publisher-side block.';
+    if (errorKind === 'source_bad_xml')
+      return 'A source returned malformed XML (probably an HTML error/landing page). The AI tokens are fine — remove or update that feed under Catalog → Sources.';
     if (errorKind === 'auth' || errorKind === 'no_token')
       return 'AI token rejected or missing — check Catalog → AI Settings.';
     if (errorKind === 'network')
@@ -5999,12 +6055,21 @@ function AnalyzeProgressBar() {
 }
 
 // Scheduler status card — shows last/next automatic poll for each category and
-// lets the user toggle the scheduler on/off or fire a single job on demand.
+// lets the user toggle the scheduler on/off, edit each job's firing time, or
+// fire a single job on demand.
 function SchedulerCard({ onChange }) {
   const [status, setStatus] = useState(null);
   const [busy, setBusy] = useState(false);
   const [open, setOpen] = useState(true);
   const [errorsModal, setErrorsModal] = useState(null); // { jobLabel, details: [...] }
+  const [editJob, setEditJob] = useState(null);         // job being edited
+  const [editMinute, setEditMinute] = useState('0');
+  const [editHour, setEditHour] = useState('');         // '' = hourly, '0'..'23' = daily
+  const [editCadence, setEditCadence] = useState('hourly'); // 'hourly' | 'daily'
+  const [savingEdit, setSavingEdit] = useState(false);
+  // Live per-row progress when "Run now" returns a tracked jobId (currently
+  // for spoc / feature_requests). Shape: { [jobKey]: { stage, pct, detail, status } }
+  const [runProgress, setRunProgress] = useState({});
 
   const load = async () => {
     try { setStatus(await api.get('/scheduler/status')); } catch (_) {}
@@ -6021,22 +6086,100 @@ function SchedulerCard({ onChange }) {
     try {
       await api.post('/scheduler/toggle', { enabled: !status.enabled });
       await load();
-      window.toast(status.enabled ? 'Hourly scheduler paused' : 'Hourly scheduler enabled — runs at :00 / :20 / :40', 'success');
+      window.toast(status.enabled ? 'Scheduler paused' : 'Scheduler enabled', 'success');
     } catch (e) { window.toast('Failed: ' + e.message, 'error'); }
     finally { setBusy(false); }
   };
 
   const runNow = async (key) => {
     setBusy(true);
+    setRunProgress(prev => ({ ...prev, [key]: { stage: 'start', pct: 0, detail: 'starting…', status: 'running' } }));
     try {
-      await api.post(`/scheduler/run-now/${key}`, {});
+      const r = await api.post(`/scheduler/run-now/${key}`, {});
       window.dispatchEvent(new Event('pm:job-started'));
-      window.toast(`Started ${key} poll — watch the progress bar`, 'info');
-      setTimeout(load, 1500);
-      onChange && onChange();
+      // SPOC / Feature Requests: poll the tracked job for live progress.
+      if (r && r.jobId && r.statusUrl) {
+        window.toast(`Started ${key} — watching progress…`, 'info');
+        const statusPath = r.statusUrl.replace(/^\/api/, '');
+        let final = null;
+        while (true) {
+          await new Promise(res => setTimeout(res, 500));
+          let s;
+          try { s = await api.get(statusPath); }
+          catch (e) {
+            setRunProgress(prev => ({ ...prev, [key]: { stage: 'error', pct: 100, detail: e.message, status: 'error' } }));
+            break;
+          }
+          setRunProgress(prev => ({ ...prev, [key]: { stage: s.stage, pct: s.pct, detail: s.detail, status: s.status } }));
+          if (s.status !== 'running') { final = s; break; }
+        }
+        if (final) {
+          const result = final.result || {};
+          if (final.status === 'error' || result.error) {
+            window.toast(final.error || result.error, 'error');
+          } else if (result.skipped) {
+            window.toast(`${key} skipped: ${result.reason}`, 'info', 6000);
+          } else if (result.file != null) {
+            window.toast(`${key}: imported ${result.rowsNew}/${result.rowsTotal} new rows`, 'success');
+          } else {
+            window.toast(`${key} finished`, 'success');
+          }
+        }
+        await load();
+        onChange && onChange();
+        // Keep the bar at 100% briefly so the user sees "done".
+        setTimeout(() => setRunProgress(prev => { const n = { ...prev }; delete n[key]; return n; }), 2000);
+      } else {
+        // Catalog / analysts / industry / digest: no per-job tracker; the
+        // global AnalyzeProgressBar at the top of the page shows progress.
+        setRunProgress(prev => { const n = { ...prev }; delete n[key]; return n; });
+        window.toast(`Started ${key} — watch the progress bar at the top`, 'info');
+        setTimeout(load, 1500);
+        onChange && onChange();
+      }
     } catch (e) {
+      setRunProgress(prev => { const n = { ...prev }; delete n[key]; return n; });
       window.toast(e.message || 'Failed', 'error');
     } finally { setBusy(false); }
+  };
+
+  const openEdit = (job) => {
+    setEditJob(job);
+    setEditMinute(String(job.minute));
+    if (job.hour == null) { setEditCadence('hourly'); setEditHour(''); }
+    else { setEditCadence('daily'); setEditHour(String(job.hour)); }
+  };
+  const closeEdit = () => { setEditJob(null); setSavingEdit(false); };
+  const resetEditToDefault = () => {
+    if (!editJob || !editJob.defaults) return;
+    setEditMinute(String(editJob.defaults.minute));
+    if (editJob.defaults.hour == null) { setEditCadence('hourly'); setEditHour(''); }
+    else { setEditCadence('daily'); setEditHour(String(editJob.defaults.hour)); }
+  };
+  const saveEdit = async () => {
+    if (!editJob) return;
+    const minute = parseInt(editMinute, 10);
+    if (!Number.isFinite(minute) || minute < 0 || minute > 59) {
+      window.toast('Minute must be 0–59', 'error'); return;
+    }
+    let hour = null;
+    if (editCadence === 'daily') {
+      hour = parseInt(editHour, 10);
+      if (!Number.isFinite(hour) || hour < 0 || hour > 23) {
+        window.toast('Hour must be 0–23', 'error'); return;
+      }
+    }
+    setSavingEdit(true);
+    try {
+      await api.put(`/scheduler/jobs/${editJob.key}/schedule`, { minute, hour });
+      const slot = hour == null ? `every hour at :${String(minute).padStart(2,'0')}` : `daily at ${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}`;
+      window.toast(`${editJob.label} → ${slot}`, 'success');
+      closeEdit();
+      await load();
+    } catch (e) {
+      window.toast(e.message || 'Failed to save schedule', 'error');
+      setSavingEdit(false);
+    }
   };
 
   if (!status) return null;
@@ -6059,6 +6202,15 @@ function SchedulerCard({ onChange }) {
     const h = Math.round(m / 60);
     return diff > 0 ? `in ${h}h` : `${h}h ago`;
   };
+  const fmtSlot = (j) => {
+    const mm = String(j.minute).padStart(2,'0');
+    if (j.hour == null) return `hourly :${mm}`;
+    return `daily ${String(j.hour).padStart(2,'0')}:${mm}`;
+  };
+  const isCustomSlot = (j) => {
+    if (!j.defaults) return false;
+    return j.minute !== j.defaults.minute || (j.hour ?? null) !== (j.defaults.hour ?? null);
+  };
 
   return (
     <div className={'dash-widget collapsible scheduler-card' + (open ? ' open' : '')} style={{marginBottom:12}}>
@@ -6073,9 +6225,9 @@ function SchedulerCard({ onChange }) {
         >
           <Icon name={open ? 'chevDown' : 'chevRight'} size={14} className="collapsible-chev"/>
           <Icon name="clock" size={16}/>
-          <h3>Hourly scheduler</h3>
+          <h3>Scheduler</h3>
           <span className={'badge ' + (status.enabled ? 'medium' : '')}>{status.enabled ? 'ON' : 'paused'}</span>
-          <span className="muted collapsible-sub">Polls each category at a different minute slot to avoid token contention</span>
+          <span className="muted collapsible-sub">Click <em>Edit</em> on any row to change when it fires</span>
         </div>
         <div className="collapsible-actions">
           <button className="ghost small" onClick={toggle} disabled={busy}>
@@ -6123,17 +6275,119 @@ function SchedulerCard({ onChange }) {
                 return (
                   <tr key={j.key}>
                     <td><strong>{j.label}</strong></td>
-                    <td className="muted">:{String(j.minute).padStart(2,'0')}</td>
+                    <td className="muted" title={isCustomSlot(j) && j.defaults ? `default: ${j.defaults.hour == null ? 'hourly' : 'daily ' + String(j.defaults.hour).padStart(2,'0')}:${String(j.defaults.minute).padStart(2,'0')}` : ''}>
+                      {fmtSlot(j)}
+                      {isCustomSlot(j) ? <span className="badge" style={{marginLeft:6, fontSize:10}}>custom</span> : null}
+                    </td>
                     <td>{fmtTime(j.lastRun)} <span className="muted" style={{fontSize:11}}>{fmtRelative(j.lastRun)}</span></td>
-                    <td>{resultCell}</td>
+                    <td>
+                      {runProgress[j.key] ? (
+                        <div className="spoc-progress" style={{minWidth:180}}>
+                          <div className="spoc-progress-head">
+                            <span className="spoc-progress-stage">{stageLabel(runProgress[j.key].stage)}</span>
+                            <span className="spoc-progress-pct">{runProgress[j.key].pct || 0}%</span>
+                          </div>
+                          <div className="spoc-progress-bar">
+                            <div
+                              className={'spoc-progress-fill' + (runProgress[j.key].status === 'error' ? ' err' : '') + (runProgress[j.key].status === 'done' ? ' ok' : '')}
+                              style={{width: `${Math.max(2, runProgress[j.key].pct || 0)}%`}}
+                            />
+                          </div>
+                          {runProgress[j.key].detail && <div className="spoc-progress-detail" title={runProgress[j.key].detail}>{String(runProgress[j.key].detail).slice(0, 60)}</div>}
+                        </div>
+                      ) : resultCell}
+                    </td>
                     <td>{status.enabled ? <>{fmtTime(j.nextRun)} <span className="muted" style={{fontSize:11}}>{fmtRelative(j.nextRun)}</span></> : <span className="muted">—</span>}</td>
-                    <td><button className="ghost small" onClick={() => runNow(j.key)} disabled={busy}>Run now</button></td>
+                    <td style={{whiteSpace:'nowrap'}}>
+                      <button className="ghost small" onClick={() => openEdit(j)} disabled={busy} title="Edit firing time" style={{marginRight:4}}>Edit</button>
+                      <button className="ghost small" onClick={() => runNow(j.key)} disabled={busy || !!runProgress[j.key]}>{runProgress[j.key] ? 'Running…' : 'Run now'}</button>
+                    </td>
                   </tr>
                 );
               })}
             </tbody>
           </table>
         </div>
+      )}
+      {editJob && (
+        <Modal onClose={closeEdit}>
+          <div style={{ maxWidth: 460 }}>
+            <h3 style={{ margin: '0 0 4px' }}>Schedule — {editJob.label}</h3>
+            <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
+              All times are server local time. Changes apply on the next scheduler tick (≤ 60 s) — no restart needed.
+            </p>
+            <div className="row" style={{ gap: 16, alignItems: 'flex-start', marginTop: 12 }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <input
+                  type="radio"
+                  name="cadence"
+                  value="hourly"
+                  checked={editCadence === 'hourly'}
+                  onChange={() => setEditCadence('hourly')}
+                />
+                <span>Hourly — fire every hour at :MM</span>
+              </label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <input
+                  type="radio"
+                  name="cadence"
+                  value="daily"
+                  checked={editCadence === 'daily'}
+                  onChange={() => { setEditCadence('daily'); if (editHour === '') setEditHour('0'); }}
+                />
+                <span>Daily — fire once per day at HH:MM</span>
+              </label>
+            </div>
+            <div className="row" style={{ gap: 12, alignItems: 'flex-end', marginTop: 14 }}>
+              {editCadence === 'daily' && (
+                <div>
+                  <label className="muted" style={{ fontSize: 12, display: 'block' }}>Hour (0–23)</label>
+                  <input
+                    type="number" min="0" max="23"
+                    value={editHour}
+                    onChange={(e) => setEditHour(e.target.value)}
+                    style={{ width: 80 }}
+                  />
+                </div>
+              )}
+              <div>
+                <label className="muted" style={{ fontSize: 12, display: 'block' }}>Minute (0–59)</label>
+                <input
+                  type="number" min="0" max="59"
+                  value={editMinute}
+                  onChange={(e) => setEditMinute(e.target.value)}
+                  style={{ width: 80 }}
+                />
+              </div>
+              <div className="muted" style={{ fontSize: 12 }}>
+                Preview:&nbsp;
+                <strong>
+                  {editCadence === 'hourly'
+                    ? `hourly :${String(parseInt(editMinute,10) || 0).padStart(2,'0')}`
+                    : `daily ${String(parseInt(editHour,10) || 0).padStart(2,'0')}:${String(parseInt(editMinute,10) || 0).padStart(2,'0')}`}
+                </strong>
+              </div>
+            </div>
+            {editJob.defaults && (
+              <p className="muted" style={{ fontSize: 12, marginTop: 12 }}>
+                Default: <code>
+                  {editJob.defaults.hour == null
+                    ? `hourly :${String(editJob.defaults.minute).padStart(2,'0')}`
+                    : `daily ${String(editJob.defaults.hour).padStart(2,'0')}:${String(editJob.defaults.minute).padStart(2,'0')}`}
+                </code>
+                <button className="ghost small" type="button" onClick={resetEditToDefault} style={{ marginLeft: 8 }}>
+                  Reset to default
+                </button>
+              </p>
+            )}
+            <div className="row" style={{ justifyContent: 'flex-end', marginTop: 16, gap: 8 }}>
+              <button className="ghost" onClick={closeEdit} disabled={savingEdit}>Cancel</button>
+              <button className="primary" onClick={saveEdit} disabled={savingEdit}>
+                {savingEdit ? 'Saving…' : 'Save schedule'}
+              </button>
+            </div>
+          </div>
+        </Modal>
       )}
       {errorsModal && (
         <Modal onClose={() => setErrorsModal(null)}>

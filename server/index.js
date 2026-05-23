@@ -694,9 +694,35 @@ app.post('/api/chat', async (req, res) => {
 });
 
 app.get('/api/raw-items', (req, res) => {
-  const where = req.query.product_id ? 'WHERE ri.product_id = ?' : '';
-  const params = req.query.product_id ? [req.query.product_id] : [];
-  const rows = db.prepare(`SELECT ri.id, ri.source_id, ri.product_id, ri.hash, ri.title, ri.url, ri.published_at, ri.fetched_at, ri.status, s.kind AS source_kind, p.is_own AS is_own_product FROM raw_items ri LEFT JOIN sources s ON s.id = ri.source_id LEFT JOIN products p ON p.id = ri.product_id ${where} ORDER BY COALESCE(ri.published_at, ri.fetched_at) DESC, ri.id DESC LIMIT 200`).all(...params);
+  // Optional filters used by the Feed/Analyst/News tabs so the LIMIT applies
+  // to the slice the tab actually shows (otherwise mixing kinds across
+  // products meant the most-recent N rows would be dominated by whichever
+  // section happened to ingest most recently — competitor tab would only
+  // see ~20 of its own rows).
+  //   ?kind=product|analyst|news   filter by products.kind
+  //   ?own=0                        exclude own products (is_own=1)
+  //   ?exclude_source_kind=html     skip page-snapshot HTML sources
+  //   ?limit=N                      override default 200 (capped at 2000)
+  const where = [];
+  const params = [];
+  if (req.query.product_id) {
+    where.push('ri.product_id = ?');
+    params.push(req.query.product_id);
+  }
+  if (req.query.kind) {
+    where.push("COALESCE(p.kind, 'product') = ?");
+    params.push(String(req.query.kind));
+  }
+  if (req.query.own === '0') {
+    where.push('COALESCE(p.is_own, 0) = 0');
+  }
+  if (req.query.exclude_source_kind) {
+    where.push('(s.kind IS NULL OR s.kind != ?)');
+    params.push(String(req.query.exclude_source_kind));
+  }
+  const wsql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const lim = Math.min(2000, Math.max(1, +req.query.limit || 200));
+  const rows = db.prepare(`SELECT ri.id, ri.source_id, ri.product_id, ri.hash, ri.title, ri.url, ri.published_at, ri.fetched_at, ri.status, s.kind AS source_kind, p.is_own AS is_own_product FROM raw_items ri LEFT JOIN sources s ON s.id = ri.source_id LEFT JOIN products p ON p.id = ri.product_id ${wsql} ORDER BY COALESCE(ri.published_at, ri.fetched_at) DESC, ri.id DESC LIMIT ${lim}`).all(...params);
   res.json(rows);
 });
 
@@ -812,7 +838,7 @@ async function ingestRunAll({ product_id, product_kind, auto = true } = {}) {
         results.push({ source_id: src.id, error: e.message });
         ingestJob.errors++;
         ingestJob.lastError = e.message;
-        ingestJob.lastErrorKind = classifyError(e.message);
+        ingestJob.lastErrorKind = classifyIngestError(e.message);
       }
       ingestJob.done++;
     }
@@ -992,6 +1018,25 @@ function classifyError(msg) {
   if (m.includes('timeout') || m.includes('econnreset') || m.includes('enotfound') || m.includes('network')) return 'network';
   return 'other';
 }
+
+// Ingest-specific classifier. Same buckets as `classifyError` but treats HTTP
+// 401/403/429 as `source_blocked`/`source_rate_limit` (a publisher refusing
+// us, not a GitHub Models auth problem). Without this, a single 403 from a
+// CDN-fronted RSS feed (e.g. BleepingComputer) would surface in the UI as
+// "AI token rejected or missing", which sent users on a wild goose chase.
+function classifyIngestError(msg) {
+  if (!msg) return 'other';
+  const m = msg.toLowerCase();
+  if (m.includes('429') || m.includes('rate limit') || m.includes('too many requests')) return 'source_rate_limit';
+  if (m.includes('http 401') || m.includes('http 403') || m.includes(' 401') || m.includes(' 403') ||
+      m.includes('unauthor') || m.includes('forbidden')) return 'source_blocked';
+  if (m.includes('unexpected close tag') || m.includes('non-whitespace before first tag') ||
+      m.includes('invalid character') || m.includes('not well-formed') ||
+      m.includes('parse error') || m.includes('unexpected end')) return 'source_bad_xml';
+  if (m.includes('timeout') || m.includes('econnreset') || m.includes('enotfound') || m.includes('network') ||
+      m.includes('socket') || m.includes('aborted')) return 'network';
+  return 'other';
+}
 function resetAnalyzeJob(total) {
   analyzeJob.running = true;
   analyzeJob.total = total;
@@ -1158,23 +1203,86 @@ app.post('/api/raw-items/:id/analyze', async (req, res) => {
 //   :20  analyst firms
 //   :40  industry news
 // Each run respects ingestJob.running and skips if a job is in progress.
+//
+// Every job's minute (and optional hour) can be overridden from the UI via
+// PUT /api/scheduler/jobs/:key/schedule. The override is stored in `settings`
+// under `scheduler_<key>_minute` / `scheduler_<key>_hour` and read on every
+// scheduler tick, so changes apply without a restart.
+const SCHEDULER_DEFAULTS = {
+  catalog:          { minute:  0, hour: null },  // hourly
+  analysts:         { minute: 20, hour: null },  // hourly
+  industry:         { minute: 40, hour: null },  // hourly
+  spoc:             { minute: 10, hour:   0 },   // daily 00:10
+  feature_requests: { minute: 20, hour:   0 },   // daily 00:20
+  digest:           { minute: 15, hour:   0 },   // daily 00:15
+};
+function readJobMinute(key) {
+  const raw = readSettingRaw(`scheduler_${key}_minute`);
+  if (raw == null || raw === '') return SCHEDULER_DEFAULTS[key].minute;
+  const v = +raw;
+  return Number.isFinite(v) ? v : SCHEDULER_DEFAULTS[key].minute;
+}
+function readJobHour(key) {
+  const raw = readSettingRaw(`scheduler_${key}_hour`);
+  if (raw == null || raw === '' || raw === 'null') {
+    return SCHEDULER_DEFAULTS[key].hour; // may be null (= hourly)
+  }
+  const v = +raw;
+  return Number.isFinite(v) ? v : SCHEDULER_DEFAULTS[key].hour;
+}
+// The digest job historically used `mail_digest_hour` / `mail_digest_minute`
+// settings (from the Email-digest panel). Keep those as additional fallback
+// so existing customisations survive this refactor.
+function readDigestMinute() {
+  const override = readSettingRaw('scheduler_digest_minute');
+  if (override != null && override !== '') {
+    const v = +override; if (Number.isFinite(v)) return v;
+  }
+  const legacy = readSettingRaw('mail_digest_minute');
+  if (legacy != null && legacy !== '') {
+    const v = +legacy; if (Number.isFinite(v)) return v;
+  }
+  return SCHEDULER_DEFAULTS.digest.minute;
+}
+function readDigestHour() {
+  const override = readSettingRaw('scheduler_digest_hour');
+  if (override != null && override !== '' && override !== 'null') {
+    const v = +override; if (Number.isFinite(v)) return v;
+  }
+  const legacy = readSettingRaw('mail_digest_hour');
+  if (legacy != null && legacy !== '') {
+    const v = +legacy; if (Number.isFinite(v)) return v;
+  }
+  return SCHEDULER_DEFAULTS.digest.hour;
+}
+
 const SCHEDULER_KINDS = [
-  { key: 'catalog',  label: 'Catalog (products)', product_kind: 'product', minute: 0 },
-  { key: 'analysts', label: 'Analyst firms',      product_kind: 'analyst', minute: 20 },
-  { key: 'industry', label: 'Industry news',      product_kind: 'news',    minute: 40 },
-  // Daily SPOC sheet sync. `hour` makes the slot daily-at-HH:MM instead of hourly-at-:MM.
-  { key: 'spoc',     label: 'SPOC sheet sync',    minute: 10, hour: 0,
+  { key: 'catalog',  label: 'Catalog (products)', product_kind: 'product',
+    get minute() { return readJobMinute('catalog'); },
+    get hour()   { return readJobHour('catalog'); } },
+  { key: 'analysts', label: 'Analyst firms',      product_kind: 'analyst',
+    get minute() { return readJobMinute('analysts'); },
+    get hour()   { return readJobHour('analysts'); } },
+  { key: 'industry', label: 'Industry news',      product_kind: 'news',
+    get minute() { return readJobMinute('industry'); },
+    get hour()   { return readJobHour('industry'); } },
+  // Daily SPOC sheet sync. `hour` != null makes the slot daily-at-HH:MM
+  // instead of hourly-at-:MM.
+  { key: 'spoc',     label: 'SPOC sheet sync',
+    get minute() { return readJobMinute('spoc'); },
+    get hour()   { return readJobHour('spoc'); },
     run: async () => spoc.runImport() },
-  // Daily Feature Request sheet sync (10 min after SPOC).
-  { key: 'feature_requests', label: 'Feature Request sheet sync', minute: 20, hour: 0,
+  // Daily Feature Request sheet sync (10 min after SPOC by default).
+  { key: 'feature_requests', label: 'Feature Request sheet sync',
+    get minute() { return readJobMinute('feature_requests'); },
+    get hour()   { return readJobHour('feature_requests'); },
     run: async () => featureRequests.runImport() },
   // Daily digest email. Defaults to 00:15 IST (right after SPOC sync at 00:10)
-  // so the digest covers the freshly-imported sheet. The fire time is editable
-  // from Settings → Email digest; the getters below read from `settings` on
-  // every scheduler tick, so changes apply without a restart.
+  // so the digest covers the freshly-imported sheet. The fire time is also
+  // editable from Settings → Email digest (legacy `mail_digest_*` keys).
   { key: 'digest',   label: 'Daily digest email',
-    get minute() { const v = +readSettingRaw('mail_digest_minute'); return Number.isFinite(v) ? v : 15; },
-    get hour()   { const v = +readSettingRaw('mail_digest_hour');   return Number.isFinite(v) ? v : 0; },
+    get minute() { return readDigestMinute(); },
+    get hour()   { return readDigestHour(); },
     run: async () => {
       if (!mailer.isConfigured()) return { skipped: true, reason: 'mailer not configured' };
       const to = getDailyRecipients();
@@ -1371,11 +1479,16 @@ app.get('/api/scheduler/status', (req, res) => {
     jobs: SCHEDULER_KINDS.map(j => {
       const last = +readSettingRaw(schedulerSettingKey(j.key, 'lastrun')) || null;
       const result = readJson(schedulerSettingKey(j.key, 'lastresult'));
+      const hour = Number.isInteger(j.hour) ? j.hour : null;
       return {
         key: j.key,
         label: j.label,
         product_kind: j.product_kind,
         minute: j.minute,
+        hour,                              // null = hourly, 0..23 = daily-at-HH:MM
+        cadence: hour == null ? 'hourly' : 'daily',
+        defaults: SCHEDULER_DEFAULTS[j.key] || null,
+        custom: !!j.run,                   // true for SPOC / FR / digest jobs
         lastRun: last,
         nextRun: enabled ? nextRunFor(j) : null,
         lastResult: result,
@@ -1390,9 +1503,106 @@ app.post('/api/scheduler/toggle', (req, res) => {
   res.json({ enabled: on });
 });
 
+// Update the firing slot for a scheduled job. Body:
+//   { minute: 0..59, hour: null | 0..23 }
+// hour=null switches the job to hourly cadence (fires every hour at :MM);
+// hour=0..23 switches it to daily-at-HH:MM.
+app.put('/api/scheduler/jobs/:key/schedule', (req, res) => {
+  const job = SCHEDULER_KINDS.find(j => j.key === req.params.key);
+  if (!job) return res.status(404).json({ error: 'unknown job' });
+  const b = req.body || {};
+  if (b.minute == null || !Number.isFinite(+b.minute)) {
+    return res.status(400).json({ error: 'minute (0..59) is required' });
+  }
+  const minute = Math.trunc(+b.minute);
+  if (minute < 0 || minute > 59) return res.status(400).json({ error: 'minute must be 0..59' });
+  let hour = null;
+  if (b.hour != null && b.hour !== '' && b.hour !== 'null') {
+    if (!Number.isFinite(+b.hour)) return res.status(400).json({ error: 'hour must be 0..23 or null' });
+    hour = Math.trunc(+b.hour);
+    if (hour < 0 || hour > 23) return res.status(400).json({ error: 'hour must be 0..23 or null' });
+  }
+  writeSettingRaw(`scheduler_${job.key}_minute`, String(minute));
+  writeSettingRaw(`scheduler_${job.key}_hour`,   hour == null ? '' : String(hour));
+  // Mirror to legacy keys so the existing Email-digest panel stays in sync.
+  if (job.key === 'digest') {
+    writeSettingRaw('mail_digest_minute', String(minute));
+    if (hour != null) writeSettingRaw('mail_digest_hour', String(hour));
+  }
+  res.json({
+    key: job.key,
+    minute: job.minute,
+    hour: Number.isInteger(job.hour) ? job.hour : null,
+    cadence: Number.isInteger(job.hour) ? 'daily' : 'hourly',
+    nextRun: schedulerEnabled() ? nextRunFor(job) : null,
+  });
+});
+
 app.post('/api/scheduler/run-now/:key', async (req, res) => {
   const job = SCHEDULER_KINDS.find(j => j.key === req.params.key);
   if (!job) return res.status(404).json({ error: 'unknown job' });
+
+  // SPOC / Feature Requests have their own job-tracker so the UI can render
+  // a real progress bar (the global ingest progress bar only covers RSS/HTML
+  // catalog polls). Route through that machinery instead of calling
+  // runImport directly, otherwise "Run now" just silently does work in the
+  // background with no UI feedback.
+  if (req.params.key === 'spoc' || req.params.key === 'feature_requests') {
+    const force = !!(req.body && req.body.force);
+    const isFr = req.params.key === 'feature_requests';
+    const jobsMap = isFr ? frJobs : spocJobs;
+    const runner = isFr ? featureRequests.runImport : spoc.runImport;
+    const jobId = `${isFr ? 'fr' : 'spoc'}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const trackedJob = {
+      id: jobId, status: 'running', stage: 'start', pct: 0, detail: 'queued',
+      startedAt: Date.now(), finishedAt: null, result: null, error: null, log: [],
+    };
+    jobsMap.set(jobId, trackedJob);
+    const startedAt = trackedJob.startedAt;
+    (async () => {
+      try {
+        const result = await runner({
+          force,
+          onProgress: (stage, pct, detail) => {
+            trackedJob.stage = stage;
+            if (typeof pct === 'number') trackedJob.pct = Math.max(trackedJob.pct, Math.min(100, Math.round(pct)));
+            if (detail) {
+              trackedJob.detail = detail;
+              trackedJob.log.push({ t: Date.now(), stage, pct: trackedJob.pct, detail });
+              if (trackedJob.log.length > 200) trackedJob.log.splice(0, trackedJob.log.length - 200);
+            }
+          },
+        });
+        trackedJob.result = result;
+        trackedJob.status = result && result.error ? 'error' : 'done';
+        if (result && result.error) trackedJob.error = result.error;
+        trackedJob.pct = 100;
+        trackedJob.stage = trackedJob.status === 'error' ? 'error' : 'done';
+        trackedJob.finishedAt = Date.now();
+        // Mirror the scheduler `lastresult` row so the table refreshes too.
+        writeJson(schedulerSettingKey(job.key, 'lastresult'), {
+          startedAt, finishedAt: trackedJob.finishedAt, ...(result || {}),
+        });
+        writeSettingRaw(schedulerSettingKey(job.key, 'lastrun'), String(startedAt));
+      } catch (e) {
+        trackedJob.status = 'error'; trackedJob.stage = 'error';
+        trackedJob.error = e.message; trackedJob.detail = e.message;
+        trackedJob.pct = 100; trackedJob.finishedAt = Date.now();
+        writeJson(schedulerSettingKey(job.key, 'lastresult'), {
+          startedAt, finishedAt: trackedJob.finishedAt, error: e.message || String(e),
+        });
+        writeSettingRaw(schedulerSettingKey(job.key, 'lastrun'), String(startedAt));
+      } finally {
+        setTimeout(() => jobsMap.delete(jobId), 5 * 60 * 1000).unref?.();
+      }
+    })();
+    return res.json({
+      ok: true, jobId,
+      statusUrl: `/api/${isFr ? 'fr' : 'spoc'}/import-status/${jobId}`,
+      kind: isFr ? 'fr' : 'spoc',
+    });
+  }
+
   if (typeof job.run !== 'function' && (ingestJob.running || analyzeJob.running)) {
     return res.status(409).json({ error: 'another job is running' });
   }
@@ -1485,9 +1695,11 @@ app.put('/api/mail/settings', (req, res) => {
     digestMinute: time.minute,
   });
 });
-app.get('/api/mail/digest/preview', (_req, res) => {
+app.get('/api/mail/digest/preview', (req, res) => {
   try {
-    const d = dailyDigest.build();
+    const h = +((req.query && req.query.hours) || 0);
+    const hours = Number.isFinite(h) && h > 0 && h <= 24 * 30 ? Math.floor(h) : 24;
+    const d = dailyDigest.build({ hours });
     res.set('Content-Type', 'text/html; charset=utf-8').send(d.html);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1803,6 +2015,7 @@ app.get(/^\/(?!api\/).*/, (req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`PM Panel API on http://localhost:${PORT} (LLM: ${llm.hasToken() ? llm.getModel() : 'DISABLED — open Catalog → AI Settings'})`);
+  console.log('[build] digest-dedup-v2 + url-hash-ingest @', new Date().toISOString());
   // Write our PID so the wrapper script (pm-panel.bat / pm-panel.sh) can
   // reliably stop / status us without scanning for stray node.exe processes.
   try {

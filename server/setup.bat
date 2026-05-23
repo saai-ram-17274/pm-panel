@@ -1,14 +1,18 @@
 @echo off
 REM PM Panel one-time setup script (Windows)
-REM Installs prerequisites: Node deps, rebuilds native modules, optional Playwright Chromium.
-REM Usage: setup.bat [--with-playwright]
+REM Installs prerequisites: Node deps, rebuilds native modules, Playwright headless Chromium.
+REM Usage: setup.bat [--skip-playwright]
 
 setlocal EnableDelayedExpansion
 
 set "SCRIPT_DIR=%~dp0"
 pushd "%SCRIPT_DIR%" >nul
 
-set "WITH_PLAYWRIGHT=0"
+REM Playwright headless-shell is required for the SPOC remote-download path.
+REM Default ON; pass --skip-playwright to skip the ~120MB download.
+set "WITH_PLAYWRIGHT=1"
+if /I "%~1"=="--skip-playwright" set "WITH_PLAYWRIGHT=0"
+if /I "%~1"=="--no-playwright"   set "WITH_PLAYWRIGHT=0"
 if /I "%~1"=="--with-playwright" set "WITH_PLAYWRIGHT=1"
 if /I "%~1"=="-h"     goto :usage
 if /I "%~1"=="--help" goto :usage
@@ -77,17 +81,23 @@ if errorlevel 1 (
   echo     OK
 )
 
-REM 5) Optional: Playwright chromium
+REM 5) Playwright headless Chromium (needed by the SPOC remote-download path).
+REM    The runtime only ever calls chromium.launch({ headless: true }), which
+REM    since Playwright 1.49+ uses chromium-headless-shell. Installing the
+REM    headless-shell build (~120MB) instead of full chromium (~300MB).
 if "%WITH_PLAYWRIGHT%"=="1" (
   if exist node_modules\playwright (
-    echo ==^> Installing Playwright Chromium...
-    call npx --yes playwright install chromium
+    echo ==^> Installing Playwright headless Chromium...
+    call npx --yes playwright install chromium-headless-shell
   ) else if exist node_modules\playwright-core (
-    echo ==^> Installing Playwright Chromium...
-    call npx --yes playwright install chromium
+    echo ==^> Installing Playwright headless Chromium...
+    call npx --yes playwright install chromium-headless-shell
   ) else (
     echo ==^> Skipping Playwright ^(package not in dependencies^).
   )
+) else (
+  echo ==^> Skipping Playwright per --skip-playwright. SPOC remote download will fail until you run:
+  echo     npx playwright install chromium-headless-shell
 )
 
 REM 6) Inbox folder
@@ -107,7 +117,8 @@ popd >nul
 exit /b 0
 
 :usage
-echo Usage: %~nx0 [--with-playwright]
-echo   --with-playwright   Also install Playwright Chromium ^(for Zoho browser-download path^)
+echo Usage: %~nx0 [--skip-playwright]
+echo   ^(Playwright headless Chromium is installed by default for the SPOC remote-download path^)
+echo   --skip-playwright   Do not download the ~120MB headless-shell
 popd >nul
 exit /b 0
