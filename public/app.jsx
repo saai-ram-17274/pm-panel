@@ -4842,7 +4842,7 @@ function MailDigestSettingsPanel() {
         <div className="callout" style={{padding:10, border:'1px solid #f59e0b', borderRadius:6, background:'rgba(245,158,11,0.08)', marginBottom:12}}>
           <strong>Not configured.</strong> Set <code>ZOHO_MAIL_CLIENT_ID</code>, <code>ZOHO_MAIL_CLIENT_SECRET</code>,
           <code> ZOHO_MAIL_REFRESH_TOKEN</code>, <code>ZOHO_MAIL_ACCOUNT_ID</code> and <code>ZOHO_MAIL_FROM</code>
-          in <code>server/.env</code>, then restart pm-panel.
+          in <code>.env</code>, then restart pm-panel.
         </div>
       )}
 
@@ -5074,7 +5074,7 @@ function Settings() {
               <ul style={{lineHeight:1.8, paddingLeft:18}}>
                 <li><strong>Backend:</strong> Node.js + Express + SQLite (<code>pm-panel.db</code>).</li>
                 <li><strong>AI provider:</strong> <a href="https://github.com/marketplace/models" target="_blank" rel="noreferrer" style={{color:'var(--accent)'}}>GitHub Models</a> (OpenAI, Mistral, Cohere, Llama, etc.).</li>
-                <li><strong>Where data lives:</strong> everything (raw feed items, gaps, releases, your token) stays in the local SQLite file under <code>pm-panel/server/</code>.</li>
+                <li><strong>Where data lives:</strong> everything (raw feed items, gaps, releases, your token) stays in the local SQLite file under <code>pm-panel/</code>.</li>
                 <li><strong>Privacy:</strong> raw item titles + content are sent to GitHub Models for analysis. Don't ingest confidential data.</li>
               </ul>
               <div className="muted" style={{marginTop:16, fontSize:12, textAlign:'center', borderTop:'1px solid var(--border)', paddingTop:12}}>

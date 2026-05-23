@@ -36,17 +36,14 @@ config.local.*
 *.db-journal
 *.db-wal
 *.db-shm
-server/data/
-server/*.sqlite*
-server/*.db*
+data/
 
 # ---------- SPOC ingest artefacts ----------
 spoc-inbox/
-server/spoc-inbox/
 *.xlsx
 *.xls
 *.csv
-!server/lib/**/*sample*.csv
+!lib/**/*sample*.csv
 
 # ---------- Playwright ----------
 playwright-report/
@@ -59,7 +56,6 @@ logs/
 *.log
 *.pid
 .pm-panel.pid
-server/.pm-panel.pid
 
 # ---------- OS junk ----------
 .DS_Store
@@ -87,10 +83,10 @@ coverage/
 *.tmp
 tmp/
 
-# Diagnostic / probe outputs from server/scripts
+# Diagnostic / probe outputs from scripts/
 *.out
-server/run-service.ps1
-server/playwright-install.log
-server/pm-panel.log
-server/pm-panel.*.log
-server/pm-panel.pid
+run-service.ps1
+playwright-install.log
+pm-panel.log
+pm-panel.*.log
+pm-panel.pid

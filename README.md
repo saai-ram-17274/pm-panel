@@ -54,7 +54,7 @@ in-browser) frontend and a local SQLite database — no build step required.
 ```powershell
 # 1. Clone
 git clone https://github.com/<your-username>/pm-panel.git
-cd pm-panel\server
+cd pm-panel
 
 # 2. Install deps
 npm install
@@ -72,13 +72,13 @@ Then open <http://localhost:4000>.
 
 ### Windows convenience scripts
 
-- `server\setup.bat` — installs deps + Chromium in one go.
-- `server\pm-panel.bat` — starts the server.
+- `setup.bat` — installs deps + Chromium in one go.
+- `pm-panel.bat` — starts the server.
 
 ### Linux / macOS
 
-- `server/setup.sh`
-- `server/pm-panel.sh`
+- `setup.sh`
+- `pm-panel.sh`
 
 ---
 
@@ -93,14 +93,14 @@ running under `SYSTEM`. The repo ships an installer:
 
 ```powershell
 # From an *elevated* PowerShell
-cd C:\path\to\pm-panel\server
+cd C:\path\to\pm-panel
 powershell -ExecutionPolicy Bypass -File .\install-task.ps1
 ```
 
 What it does:
 
 - Stops any currently-running `pm-panel.bat` instance and frees port 4000.
-- Writes a wrapper script (`run-service.ps1`) that `cd`s into `server\`, rotates
+- Writes a wrapper script (`run-service.ps1`) that `cd`s into the repo root, rotates
   `pm-panel.log` when it crosses 5 MB, and runs `node index.js`.
 - Registers a Task Scheduler entry named **PM Panel**:
   - Runs as `SYSTEM`, highest privileges.
@@ -121,7 +121,7 @@ Stop-ScheduledTask  -TaskName "PM Panel"
 Start-ScheduledTask -TaskName "PM Panel"
 
 # Tail the log
-Get-Content C:\path\to\pm-panel\server\pm-panel.log -Tail 50 -Wait
+Get-Content C:\path\to\pm-panel\pm-panel.log -Tail 50 -Wait
 
 # Remove the service entirely
 Unregister-ScheduledTask -TaskName "PM Panel" -Confirm:$false
@@ -160,7 +160,7 @@ Playwright to look there.
 
 # 2. Install for *this* shell session too, then download both Chromium variants
 $env:PLAYWRIGHT_BROWSERS_PATH = 'C:\ProgramData\ms-playwright'
-cd C:\path\to\pm-panel\server
+cd C:\path\to\pm-panel
 npx playwright install chromium
 npx playwright install chromium-headless-shell
 
@@ -198,7 +198,7 @@ persisted in the `settings` table of the SQLite DB.
 ## Project layout
 
 ```
-server/
+pm-panel/
 ├── index.js              Express app, routes, scheduler hooks
 ├── db.js                 SQLite bootstrap
 ├── lib/
@@ -215,9 +215,8 @@ server/
 │   └── styles.css
 ├── package.json
 ├── setup.bat / setup.sh
-└── pm-panel.bat / pm-panel.sh
-
-spoc-inbox/                Local-only, ignored by git
+├── pm-panel.bat / pm-panel.sh
+└── spoc-inbox/           Local-only, ignored by git
 ```
 
 ---
@@ -262,7 +261,7 @@ git-ignored — see `.gitignore`.
 | Symptom                                           | Fix                                                                  |
 | ------------------------------------------------- | -------------------------------------------------------------------- |
 | `npm install` fails on `better-sqlite3 / node-gyp` | Switch to Node 22 LTS, or install **VS 2022 C++ Build Tools**.       |
-| `Executable doesn't exist at .../chrome-headless-shell.exe` | Run `npx playwright install chromium` in `server/`.                  |
+| `Executable doesn't exist at .../chrome-headless-shell.exe` | Run `npx playwright install chromium` in the repo root.              |
 | `npm ERR! primordials is not defined`             | Stale global npm in `%APPDATA%\npm`. Delete it and reinstall Node.   |
 | SPOC sync "no download event fired"               | The share URL likely changed or requires login — re-copy from Zoho.  |
 | Port `4000` in use                                | `set PORT=4100` (Windows) or `PORT=4100` (bash) before starting.     |
@@ -271,6 +270,6 @@ git-ignored — see `.gitignore`.
 
 ## License
 
-ISC — see `server/package.json`.
+ISC — see `package.json`.
 
 Internal use only unless explicitly opened up.
