@@ -7,6 +7,7 @@
   },
   "scripts": {
     "start": "node index.js",
+    "build": "echo \"No build step required — frontend is served as static files (Babel-standalone in the browser).\"",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
